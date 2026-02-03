@@ -314,7 +314,3 @@ psql -f test/integration/cleanup.sql
 - No support for transactions spanning multiple rows
 - Pattern must contain exactly one `{attr}` segment
 - Identity columns cannot be NULL
-
-## License
-
-MIT License - see LICENSE file for details.
