@@ -4,11 +4,13 @@ A PostgreSQL Foreign Data Wrapper (FDW) that exposes LevelDB key-value data as r
 
 ## Overview
 
-`level_pivot` bridges the gap between LevelDB's hierarchical key-value storage and PostgreSQL's relational model. It transforms structured keys into table rows by "pivoting" multiple LevelDB entries sharing a common identity into columns of a single row.
+LevelDB is a fast key-value store—nothing more than string keys mapped to string values. However, applications commonly impose structure on their keys by encoding multiple fields with delimiters, creating a pseudo-hierarchical organization within a flat namespace.
+
+`level_pivot` recognizes these patterns and transforms them into relational tables, "pivoting" multiple LevelDB entries that share a common identity into columns of a single row.
 
 ### The Problem
 
-LevelDB stores data as flat key-value pairs. Applications often encode structure into keys:
+Applications often encode structure into LevelDB keys:
 
 ```
 users##admins##user001##name   = "Alice"
