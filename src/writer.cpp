@@ -1,0 +1,195 @@
+#include "level_pivot/writer.hpp"
+
+namespace level_pivot {
+
+Writer::Writer(const Projection& projection,
+               std::shared_ptr<LevelDBConnection> connection)
+    : projection_(projection), connection_(std::move(connection)) {
+
+    if (connection_->is_read_only()) {
+        throw LevelDBError("Cannot create writer for read-only connection");
+    }
+}
+
+WriteResult Writer::insert(Datum* values, bool* nulls) {
+    WriteResult result;
+
+    // Extract identity values
+    auto identity = extract_identity(values, nulls);
+
+    // Check for null identity columns
+    for (const auto& val : identity) {
+        if (val.empty()) {
+            throw LevelPivotError("Cannot insert row with NULL identity column");
+        }
+    }
+
+    // Extract attr values and write keys
+    auto attrs = extract_attrs(values, nulls);
+
+    for (const auto& [attr_name, attr_value] : attrs) {
+        std::string key = projection_.parser().build(identity, attr_name);
+        connection_->put(key, attr_value);
+        ++result.keys_written;
+    }
+
+    return result;
+}
+
+WriteResult Writer::update(Datum* old_values, bool* old_nulls,
+                           Datum* new_values, bool* new_nulls) {
+    WriteResult result;
+
+    // Extract identity from old row (used to locate existing keys)
+    auto old_identity = extract_identity(old_values, old_nulls);
+
+    // Extract identity from new row (for key construction)
+    auto new_identity = extract_identity(new_values, new_nulls);
+
+    // Check if identity columns changed
+    bool identity_changed = (old_identity != new_identity);
+
+    if (identity_changed) {
+        // Identity changed - this is essentially DELETE + INSERT
+        // First delete all old keys
+        auto del_result = remove_by_identity(old_identity);
+        result.keys_deleted = del_result.keys_deleted;
+
+        // Then insert new keys
+        auto ins_result = insert(new_values, new_nulls);
+        result.keys_written = ins_result.keys_written;
+
+        return result;
+    }
+
+    // Identity unchanged - update in place
+    auto new_attrs = extract_attrs(new_values, new_nulls);
+    auto null_attrs = get_null_attrs(new_nulls);
+
+    // Write non-null attrs
+    for (const auto& [attr_name, attr_value] : new_attrs) {
+        std::string key = projection_.parser().build(new_identity, attr_name);
+        connection_->put(key, attr_value);
+        ++result.keys_written;
+    }
+
+    // Delete attrs that are now null
+    for (const auto& attr_name : null_attrs) {
+        std::string key = projection_.parser().build(new_identity, attr_name);
+        connection_->del(key);
+        ++result.keys_deleted;
+    }
+
+    return result;
+}
+
+WriteResult Writer::remove(Datum* values, bool* nulls) {
+    auto identity = extract_identity(values, nulls);
+    return remove_by_identity(identity);
+}
+
+WriteResult Writer::remove_by_identity(const std::vector<std::string>& identity_values) {
+    WriteResult result;
+
+    // Find and delete all keys with this identity
+    auto keys = find_keys_for_identity(identity_values);
+
+    for (const auto& key : keys) {
+        connection_->del(key);
+        ++result.keys_deleted;
+    }
+
+    return result;
+}
+
+std::vector<std::string> Writer::extract_identity(Datum* values, bool* nulls) const {
+    std::vector<std::string> identity;
+    identity.reserve(projection_.identity_columns().size());
+
+    const auto& capture_names = projection_.parser().pattern().capture_names();
+
+    for (const auto& cap_name : capture_names) {
+        const auto* col = projection_.column(cap_name);
+        if (!col) {
+            throw LevelPivotError("Identity column not found: " + cap_name);
+        }
+
+        int idx = col->attnum - 1;  // attnum is 1-based
+        if (nulls[idx]) {
+            identity.push_back("");  // Empty string for NULL
+        } else {
+            identity.push_back(TypeConverter::datum_to_string(
+                values[idx], col->type, false));
+        }
+    }
+
+    return identity;
+}
+
+std::unordered_map<std::string, std::string> Writer::extract_attrs(
+    Datum* values, bool* nulls) const {
+
+    std::unordered_map<std::string, std::string> attrs;
+
+    for (const auto* col : projection_.attr_columns()) {
+        int idx = col->attnum - 1;
+        if (!nulls[idx]) {
+            attrs[col->name] = TypeConverter::datum_to_string(
+                values[idx], col->type, false);
+        }
+    }
+
+    return attrs;
+}
+
+std::unordered_set<std::string> Writer::get_null_attrs(bool* nulls) const {
+    std::unordered_set<std::string> null_attrs;
+
+    for (const auto* col : projection_.attr_columns()) {
+        int idx = col->attnum - 1;
+        if (nulls[idx]) {
+            null_attrs.insert(col->name);
+        }
+    }
+
+    return null_attrs;
+}
+
+std::vector<std::string> Writer::find_keys_for_identity(
+    const std::vector<std::string>& identity_values) const {
+
+    std::vector<std::string> keys;
+
+    // Build prefix for this identity
+    std::string prefix = projection_.parser().build_prefix(identity_values);
+
+    // Scan for matching keys
+    auto iter = connection_->iterator();
+
+    if (prefix.empty()) {
+        iter.seek_to_first();
+    } else {
+        iter.seek(prefix);
+    }
+
+    while (iter.valid()) {
+        std::string key = iter.key();
+
+        // Check if still within prefix
+        if (!prefix.empty() && key.compare(0, prefix.size(), prefix) != 0) {
+            break;
+        }
+
+        // Parse key to check identity match
+        auto parsed = projection_.parser().parse(key);
+        if (parsed && parsed->capture_values == identity_values) {
+            keys.push_back(key);
+        }
+
+        iter.next();
+    }
+
+    return keys;
+}
+
+} // namespace level_pivot

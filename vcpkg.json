@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "level-pivot",
+  "version": "1.0.0",
+  "description": "PostgreSQL Foreign Data Wrapper for LevelDB with pivot semantics",
+  "license": "MIT",
+  "dependencies": [
+    "leveldb",
+    {
+      "name": "gtest",
+      "host": true
+    }
+  ],
+  "builtin-baseline": "cc73782a88db48af17f8bfb8328d4cab3d4c246f"
+}
