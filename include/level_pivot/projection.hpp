@@ -130,6 +130,22 @@ public:
      */
     size_t column_count() const { return columns_.size(); }
 
+    /**
+     * Get the identity value index for a column (O(1) lookup)
+     *
+     * For identity columns, returns the index into PivotRow::identity_values
+     * For non-identity columns, returns -1
+     *
+     * @param column_index Index into columns()
+     * @return Index into identity_values, or -1 if not identity
+     */
+    int column_to_identity_index(size_t column_index) const {
+        if (column_index < column_to_identity_index_.size()) {
+            return column_to_identity_index_[column_index];
+        }
+        return -1;
+    }
+
 private:
     KeyParser parser_;
     std::vector<ColumnDef> columns_;
@@ -138,6 +154,7 @@ private:
     std::unordered_map<std::string, size_t> column_name_index_;
     std::unordered_map<int, size_t> column_attnum_index_;
     std::unordered_set<std::string> attr_names_;
+    std::vector<int> column_to_identity_index_;  // -1 for non-identity columns
 
     void build_indexes();
     void validate() const;

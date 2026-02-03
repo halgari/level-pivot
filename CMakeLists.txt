@@ -130,6 +130,22 @@ if(BUILD_TESTING)
     endif()
 endif()
 
+# Benchmarks
+option(BUILD_BENCHMARKS "Build benchmarks" OFF)
+
+if(BUILD_BENCHMARKS)
+    find_package(benchmark CONFIG QUIET)
+    if(NOT benchmark_FOUND)
+        find_package(benchmark QUIET)
+    endif()
+
+    if(benchmark_FOUND)
+        add_subdirectory(test/benchmark)
+    else()
+        message(STATUS "Google Benchmark not found, skipping benchmarks")
+    endif()
+endif()
+
 # Print configuration summary
 message(STATUS "")
 message(STATUS "level_pivot configuration:")

@@ -24,10 +24,10 @@ WriteResult Writer::insert(Datum* values, bool* nulls) {
         }
     }
 
-    // Extract attr values and write keys
-    auto attrs = extract_attrs(values, nulls);
+    // Extract attr values and write keys (null attrs are ignored for INSERT)
+    auto extracted = extract_all_attrs(values, nulls);
 
-    for (const auto& [attr_name, attr_value] : attrs) {
+    for (const auto& [attr_name, attr_value] : extracted.values) {
         std::string key = projection_.parser().build(identity, attr_name);
         connection_->put(key, attr_value);
         ++result.keys_written;
@@ -63,18 +63,17 @@ WriteResult Writer::update(Datum* old_values, bool* old_nulls,
     }
 
     // Identity unchanged - update in place
-    auto new_attrs = extract_attrs(new_values, new_nulls);
-    auto null_attrs = get_null_attrs(new_nulls);
+    auto extracted = extract_all_attrs(new_values, new_nulls);
 
     // Write non-null attrs
-    for (const auto& [attr_name, attr_value] : new_attrs) {
+    for (const auto& [attr_name, attr_value] : extracted.values) {
         std::string key = projection_.parser().build(new_identity, attr_name);
         connection_->put(key, attr_value);
         ++result.keys_written;
     }
 
     // Delete attrs that are now null
-    for (const auto& attr_name : null_attrs) {
+    for (const auto& attr_name : extracted.null_names) {
         std::string key = projection_.parser().build(new_identity, attr_name);
         connection_->del(key);
         ++result.keys_deleted;
@@ -126,33 +125,20 @@ std::vector<std::string> Writer::extract_identity(Datum* values, bool* nulls) co
     return identity;
 }
 
-std::unordered_map<std::string, std::string> Writer::extract_attrs(
-    Datum* values, bool* nulls) const {
-
-    std::unordered_map<std::string, std::string> attrs;
-
-    for (const auto* col : projection_.attr_columns()) {
-        int idx = col->attnum - 1;
-        if (!nulls[idx]) {
-            attrs[col->name] = TypeConverter::datum_to_string(
-                values[idx], col->type, false);
-        }
-    }
-
-    return attrs;
-}
-
-std::unordered_set<std::string> Writer::get_null_attrs(bool* nulls) const {
-    std::unordered_set<std::string> null_attrs;
+Writer::ExtractedAttrs Writer::extract_all_attrs(Datum* values, bool* nulls) const {
+    ExtractedAttrs result;
 
     for (const auto* col : projection_.attr_columns()) {
         int idx = col->attnum - 1;
         if (nulls[idx]) {
-            null_attrs.insert(col->name);
+            result.null_names.push_back(col->name);
+        } else {
+            result.values[col->name] = TypeConverter::datum_to_string(
+                values[idx], col->type, false);
         }
     }
 
-    return null_attrs;
+    return result;
 }
 
 std::vector<std::string> Writer::find_keys_for_identity(

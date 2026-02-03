@@ -130,22 +130,17 @@ void DatumBuilder::build_datums(const PivotRow& row,
                                 Datum* values,
                                 bool* nulls) {
     const auto& columns = projection.columns();
-    const auto& capture_names = projection.parser().pattern().capture_names();
-
-    // Build a map from capture name to identity value
-    std::unordered_map<std::string, std::string> identity_by_name;
-    for (size_t i = 0; i < capture_names.size() && i < row.identity_values.size(); ++i) {
-        identity_by_name[capture_names[i]] = row.identity_values[i];
-    }
 
     for (size_t i = 0; i < columns.size(); ++i) {
         const auto& col = columns[i];
 
         if (col.is_identity) {
-            // Identity column - get value from identity_values by name
-            auto it = identity_by_name.find(col.name);
-            if (it != identity_by_name.end()) {
-                values[i] = TypeConverter::string_to_datum(it->second, col.type, nulls[i]);
+            // Identity column - use O(1) lookup via pre-computed index
+            int identity_idx = projection.column_to_identity_index(i);
+            if (identity_idx >= 0 &&
+                static_cast<size_t>(identity_idx) < row.identity_values.size()) {
+                values[i] = TypeConverter::string_to_datum(
+                    row.identity_values[identity_idx], col.type, nulls[i]);
             } else {
                 nulls[i] = true;
                 values[i] = (Datum)0;

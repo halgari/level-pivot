@@ -78,6 +78,15 @@ void Projection::build_indexes() {
     column_name_index_.clear();
     column_attnum_index_.clear();
     attr_names_.clear();
+    column_to_identity_index_.clear();
+    column_to_identity_index_.resize(columns_.size(), -1);
+
+    // Build mapping from capture name to identity index
+    const auto& capture_names = parser_.pattern().capture_names();
+    std::unordered_map<std::string, int> capture_to_index;
+    for (size_t i = 0; i < capture_names.size(); ++i) {
+        capture_to_index[capture_names[i]] = static_cast<int>(i);
+    }
 
     for (size_t i = 0; i < columns_.size(); ++i) {
         const auto& col = columns_[i];
@@ -87,6 +96,11 @@ void Projection::build_indexes() {
 
         if (col.is_identity) {
             identity_columns_.push_back(&columns_[i]);
+            // Map column index to identity value index
+            auto it = capture_to_index.find(col.name);
+            if (it != capture_to_index.end()) {
+                column_to_identity_index_[i] = it->second;
+            }
         } else {
             attr_columns_.push_back(&columns_[i]);
             attr_names_.insert(col.name);

@@ -3,9 +3,28 @@
 
 namespace level_pivot {
 
-KeyParser::KeyParser(const KeyPattern& pattern) : pattern_(pattern) {}
+KeyParser::KeyParser(const KeyPattern& pattern) : pattern_(pattern) {
+    compute_estimated_key_size();
+}
 
-KeyParser::KeyParser(const std::string& pattern) : pattern_(pattern) {}
+KeyParser::KeyParser(const std::string& pattern) : pattern_(pattern) {
+    compute_estimated_key_size();
+}
+
+void KeyParser::compute_estimated_key_size() {
+    // Estimate key size based on literals + average capture size
+    // Assume ~16 bytes per capture/attr as reasonable estimate
+    constexpr size_t avg_capture_len = 16;
+
+    estimated_key_size_ = 0;
+    for (const auto& segment : pattern_.segments()) {
+        if (std::holds_alternative<LiteralSegment>(segment)) {
+            estimated_key_size_ += std::get<LiteralSegment>(segment).text.size();
+        } else {
+            estimated_key_size_ += avg_capture_len;
+        }
+    }
+}
 
 bool KeyParser::matches(const std::string& key) const {
     return parse(key).has_value();
@@ -90,6 +109,85 @@ std::optional<ParsedKey> KeyParser::parse(const std::string& key) const {
     return result;
 }
 
+std::optional<ParsedKeyView> KeyParser::parse_view(std::string_view key) const {
+    const auto& segments = pattern_.segments();
+    ParsedKeyView result;
+    result.capture_values.reserve(pattern_.capture_count());
+
+    size_t key_pos = 0;
+
+    for (size_t seg_idx = 0; seg_idx < segments.size(); ++seg_idx) {
+        const auto& segment = segments[seg_idx];
+
+        if (std::holds_alternative<LiteralSegment>(segment)) {
+            const auto& literal = std::get<LiteralSegment>(segment);
+
+            // Check if key has this literal at current position
+            if (key.compare(key_pos, literal.text.size(), literal.text) != 0) {
+                return std::nullopt;  // Literal doesn't match
+            }
+            key_pos += literal.text.size();
+
+        } else if (std::holds_alternative<CaptureSegment>(segment)) {
+            // Find the end of this capture (next literal or end of key)
+            size_t end_pos;
+
+            if (seg_idx + 1 < segments.size()) {
+                // Next segment must be a literal (validated in KeyPattern)
+                const auto& next_literal = std::get<LiteralSegment>(segments[seg_idx + 1]);
+
+                // Find next occurrence of the delimiter
+                end_pos = key.find(next_literal.text, key_pos);
+                if (end_pos == std::string_view::npos) {
+                    return std::nullopt;  // Delimiter not found
+                }
+            } else {
+                // This is the last segment, capture to end
+                end_pos = key.size();
+            }
+
+            // Empty captures are not allowed
+            if (end_pos == key_pos) {
+                return std::nullopt;
+            }
+
+            result.capture_values.push_back(key.substr(key_pos, end_pos - key_pos));
+            key_pos = end_pos;
+
+        } else if (std::holds_alternative<AttrSegment>(segment)) {
+            // Find the end of attr (next literal or end of key)
+            size_t end_pos;
+
+            if (seg_idx + 1 < segments.size()) {
+                // Next segment must be a literal (validated in KeyPattern)
+                const auto& next_literal = std::get<LiteralSegment>(segments[seg_idx + 1]);
+
+                end_pos = key.find(next_literal.text, key_pos);
+                if (end_pos == std::string_view::npos) {
+                    return std::nullopt;
+                }
+            } else {
+                end_pos = key.size();
+            }
+
+            // Empty attr is not allowed
+            if (end_pos == key_pos) {
+                return std::nullopt;
+            }
+
+            result.attr_name = key.substr(key_pos, end_pos - key_pos);
+            key_pos = end_pos;
+        }
+    }
+
+    // Key must be fully consumed
+    if (key_pos != key.size()) {
+        return std::nullopt;
+    }
+
+    return result;
+}
+
 std::string KeyParser::build(const std::vector<std::string>& capture_values,
                              const std::string& attr_name) const {
     if (capture_values.size() != pattern_.capture_count()) {
@@ -103,6 +201,7 @@ std::string KeyParser::build(const std::vector<std::string>& capture_values,
     }
 
     std::string result;
+    result.reserve(estimated_key_size_);
     size_t capture_idx = 0;
 
     for (const auto& segment : pattern_.segments()) {
@@ -147,6 +246,7 @@ std::string KeyParser::build_prefix() const {
 
 std::string KeyParser::build_prefix(const std::vector<std::string>& capture_values) const {
     std::string result;
+    result.reserve(estimated_key_size_);
     size_t capture_idx = 0;
 
     for (const auto& segment : pattern_.segments()) {

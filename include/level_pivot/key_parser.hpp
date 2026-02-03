@@ -2,6 +2,7 @@
 
 #include "level_pivot/key_pattern.hpp"
 #include <string>
+#include <string_view>
 #include <vector>
 #include <optional>
 #include <unordered_map>
@@ -17,6 +18,32 @@ struct ParsedKey {
 
     bool operator==(const ParsedKey& other) const {
         return capture_values == other.capture_values && attr_name == other.attr_name;
+    }
+};
+
+/**
+ * Zero-copy result of parsing a LevelDB key using string_view
+ *
+ * IMPORTANT: The string_views reference the original key string.
+ * The key must remain valid for the lifetime of this struct.
+ */
+struct ParsedKeyView {
+    std::vector<std::string_view> capture_values;  // Views into original key
+    std::string_view attr_name;                    // View into original key
+
+    bool operator==(const ParsedKeyView& other) const {
+        return capture_values == other.capture_values && attr_name == other.attr_name;
+    }
+
+    // Convert to owning ParsedKey (materializes strings)
+    ParsedKey to_owned() const {
+        ParsedKey result;
+        result.capture_values.reserve(capture_values.size());
+        for (const auto& sv : capture_values) {
+            result.capture_values.emplace_back(sv);
+        }
+        result.attr_name = std::string(attr_name);
+        return result;
     }
 };
 
@@ -58,6 +85,18 @@ public:
      * @return ParsedKey if the key matches, std::nullopt otherwise
      */
     std::optional<ParsedKey> parse(const std::string& key) const;
+
+    /**
+     * Parse a key using zero-copy string_view (faster, no allocations)
+     *
+     * IMPORTANT: The returned ParsedKeyView contains string_views that
+     * reference the input key. The key must remain valid for the lifetime
+     * of the returned ParsedKeyView.
+     *
+     * @param key The LevelDB key to parse
+     * @return ParsedKeyView if the key matches, std::nullopt otherwise
+     */
+    std::optional<ParsedKeyView> parse_view(std::string_view key) const;
 
     /**
      * Build a key from capture values and attr name
@@ -109,6 +148,9 @@ public:
 
 private:
     KeyPattern pattern_;
+    size_t estimated_key_size_;  // Pre-computed estimate for build() reserve
+
+    void compute_estimated_key_size();
 };
 
 } // namespace level_pivot

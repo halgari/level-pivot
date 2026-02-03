@@ -89,16 +89,17 @@ private:
     const Projection& projection_;
     std::shared_ptr<LevelDBConnection> connection_;
 
+    // Extracted attribute values and null names in a single struct
+    struct ExtractedAttrs {
+        std::unordered_map<std::string, std::string> values;  // non-null attr values
+        std::vector<std::string> null_names;                  // names of null attrs
+    };
+
     // Extract identity column values from Datum array
     std::vector<std::string> extract_identity(Datum* values, bool* nulls) const;
 
-    // Extract attr column values from Datum array
-    // Returns map of attr_name -> value (only non-null values)
-    std::unordered_map<std::string, std::string> extract_attrs(
-        Datum* values, bool* nulls) const;
-
-    // Get set of attr names that are null
-    std::unordered_set<std::string> get_null_attrs(bool* nulls) const;
+    // Extract all attr info in a single pass (replaces extract_attrs + get_null_attrs)
+    ExtractedAttrs extract_all_attrs(Datum* values, bool* nulls) const;
 
     // Find all existing keys for an identity
     std::vector<std::string> find_keys_for_identity(

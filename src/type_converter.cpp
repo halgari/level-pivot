@@ -16,8 +16,6 @@ extern "C" {
 #include <cerrno>
 #include <algorithm>
 #include <charconv>
-#include <sstream>
-#include <iomanip>
 
 namespace level_pivot {
 
@@ -177,17 +175,19 @@ std::string TypeConverter::datum_to_string(Datum datum, PgType type, bool is_nul
         }
 
         case PgType::BYTEA: {
+            static constexpr char hex_chars[] = "0123456789abcdef";
             bytea* data = DatumGetByteaPP(datum);
             size_t len = VARSIZE_ANY_EXHDR(data);
             unsigned char* bytes = (unsigned char*)VARDATA_ANY(data);
 
-            std::ostringstream oss;
-            oss << "\\x";
+            std::string result;
+            result.reserve(2 + len * 2);
+            result = "\\x";
             for (size_t i = 0; i < len; ++i) {
-                oss << std::hex << std::setw(2) << std::setfill('0')
-                    << static_cast<int>(bytes[i]);
+                result += hex_chars[bytes[i] >> 4];
+                result += hex_chars[bytes[i] & 0x0f];
             }
-            return oss.str();
+            return result;
         }
     }
 
