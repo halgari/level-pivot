@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+            triplet: x64-linux
+          - os: windows-latest
+            name: windows-x86_64
+            triplet: x64-windows
+
+    runs-on: ${{ matrix.os }}
+    name: Build (${{ matrix.name }})
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: cc73782a88db48af17f8bfb8328d4cab3d4c246f
+
+      - name: Install PostgreSQL (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql postgresql-server-dev-all
+
+      - name: Install PostgreSQL (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install postgresql16 --params '/Password:postgres' -y
+          echo "PostgreSQL_ROOT=C:\Program Files\PostgreSQL\16" >> $env:GITHUB_ENV
+          echo "C:\Program Files\PostgreSQL\16\bin" >> $env:GITHUB_PATH
+
+      - name: Configure CMake (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake --preset release
+
+      - name: Configure CMake (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake --preset release `
+            -DPostgreSQL_ROOT="C:\Program Files\PostgreSQL\16" `
+            -DPostgreSQL_INCLUDE_DIR="C:\Program Files\PostgreSQL\16\include" `
+            -DPostgreSQL_LIBRARY="C:\Program Files\PostgreSQL\16\lib\postgres.lib"
+
+      - name: Build
+        run: cmake --build build/release --config Release
+
+      - name: Run Tests
+        run: ctest --test-dir build/release --build-config Release --output-on-failure
+
+      - name: Prepare artifacts (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p artifacts/level-pivot-${{ matrix.name }}
+          cp build/release/level_pivot.so artifacts/level-pivot-${{ matrix.name }}/
+          cp sql/level_pivot--1.0.sql artifacts/level-pivot-${{ matrix.name }}/
+          cp sql/level_pivot.control artifacts/level-pivot-${{ matrix.name }}/
+          cp README.md artifacts/level-pivot-${{ matrix.name }}/
+          cp LICENSE artifacts/level-pivot-${{ matrix.name }}/
+          cd artifacts && tar -czvf level-pivot-${{ matrix.name }}.tar.gz level-pivot-${{ matrix.name }}
+
+      - name: Prepare artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts\level-pivot-${{ matrix.name }}
+          Copy-Item build\release\Release\level_pivot.dll artifacts\level-pivot-${{ matrix.name }}\
+          Copy-Item sql\level_pivot--1.0.sql artifacts\level-pivot-${{ matrix.name }}\
+          Copy-Item sql\level_pivot.control artifacts\level-pivot-${{ matrix.name }}\
+          Copy-Item README.md artifacts\level-pivot-${{ matrix.name }}\
+          Copy-Item LICENSE artifacts\level-pivot-${{ matrix.name }}\
+          Compress-Archive -Path artifacts\level-pivot-${{ matrix.name }} -DestinationPath artifacts\level-pivot-${{ matrix.name }}.zip
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: level-pivot-${{ matrix.name }}
+          path: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find artifacts -type f
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+          generate_release_notes: true
