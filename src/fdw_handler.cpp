@@ -12,6 +12,7 @@ extern "C" {
 #include "access/table.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
+#include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
@@ -61,6 +62,7 @@ struct LevelPivotScanState {
     std::shared_ptr<level_pivot::LevelDBConnection> connection;
     MemoryContext temp_context;
     bool cleaned_up;
+    std::vector<std::string> prefix_values;  // Pushdown filter values
 
     LevelPivotScanState() : temp_context(nullptr), cleaned_up(false) {}
 
@@ -193,6 +195,153 @@ build_projection_from_relation(Relation rel, const std::string& key_pattern)
     return std::make_unique<level_pivot::Projection>(pattern, std::move(columns));
 }
 
+/**
+ * Parse fdw_private list and build prefix values for filter pushdown.
+ *
+ * @param fdw_private List of (attnum, value) pairs from GetForeignPlan
+ * @param projection Table projection to get identity column order
+ * @return Vector of prefix values in identity column order
+ */
+static std::vector<std::string>
+build_prefix_from_fdw_private(List *fdw_private,
+                              const level_pivot::Projection& projection)
+{
+    /* Parse fdw_private into attnum->value map */
+    std::unordered_map<AttrNumber, std::string> filter_values;
+
+    ListCell *lc = list_head(fdw_private);
+    while (lc != NULL)
+    {
+        AttrNumber attnum = intVal(lfirst(lc));
+        lc = lnext(fdw_private, lc);
+        if (lc == NULL)
+            break;
+        char *value = strVal(lfirst(lc));
+        lc = lnext(fdw_private, lc);
+        filter_values[attnum] = std::string(value);
+    }
+
+    /*
+     * Build prefix_values in identity column order.
+     * Only include leading consecutive columns - stop at first missing one.
+     */
+    std::vector<std::string> prefix_values;
+    const auto& identity_cols = projection.identity_columns();
+
+    for (const auto* col : identity_cols)
+    {
+        auto it = filter_values.find(col->attnum);
+        if (it != filter_values.end())
+            prefix_values.push_back(it->second);
+        else
+            break;  /* Stop at first missing identity column */
+    }
+
+    return prefix_values;
+}
+
+/**
+ * Check if a clause is a pushable equality condition on an identity column.
+ *
+ * For filter pushdown, we only support simple "column = constant" expressions
+ * where the column is an identity column (part of the key pattern).
+ *
+ * @param clause The expression to check
+ * @param baserel The relation being scanned
+ * @param identity_attnums Attribute numbers of identity columns
+ * @param out_attnum Output: the attribute number of the matched column
+ * @param out_value Output: the constant value (must be pfree'd by caller)
+ * @return true if this is a pushable equality condition
+ */
+static bool
+is_pushable_equality(Expr *clause, RelOptInfo *baserel,
+                     const std::vector<AttrNumber>& identity_attnums,
+                     AttrNumber *out_attnum, char **out_value)
+{
+    /* Must be an OpExpr */
+    if (!IsA(clause, OpExpr))
+        return false;
+
+    OpExpr *op = (OpExpr *) clause;
+
+    /* Must have exactly 2 arguments */
+    if (list_length(op->args) != 2)
+        return false;
+
+    /* Check for equality operator by looking up the operator */
+    HeapTuple opertup = SearchSysCache1(OPEROID, ObjectIdGetDatum(op->opno));
+    if (!HeapTupleIsValid(opertup))
+        return false;
+
+    Form_pg_operator operform = (Form_pg_operator) GETSTRUCT(opertup);
+    bool is_equality = (operform->oprresult == BOOLOID &&
+                        strcmp(NameStr(operform->oprname), "=") == 0);
+    ReleaseSysCache(opertup);
+
+    if (!is_equality)
+        return false;
+
+    Expr *left = (Expr *) linitial(op->args);
+    Expr *right = (Expr *) lsecond(op->args);
+
+    /* Look for Var = Const pattern (either direction) */
+    Var *var = NULL;
+    Const *constval = NULL;
+
+    if (IsA(left, Var) && IsA(right, Const)) {
+        var = (Var *) left;
+        constval = (Const *) right;
+    } else if (IsA(left, Const) && IsA(right, Var)) {
+        var = (Var *) right;
+        constval = (Const *) left;
+    } else {
+        return false;
+    }
+
+    /* Check if var is from this relation */
+    if (var->varno != baserel->relid)
+        return false;
+
+    /* Check if this is an identity column */
+    bool is_identity = false;
+    for (AttrNumber id_attnum : identity_attnums) {
+        if (var->varattno == id_attnum) {
+            is_identity = true;
+            break;
+        }
+    }
+    if (!is_identity)
+        return false;
+
+    /* Must not be NULL */
+    if (constval->constisnull)
+        return false;
+
+    /* Convert Datum to string based on type */
+    char *value = NULL;
+    Oid typid = constval->consttype;
+
+    if (typid == TEXTOID || typid == VARCHAROID || typid == BPCHAROID) {
+        value = TextDatumGetCString(constval->constvalue);
+    } else if (typid == INT4OID) {
+        int32 intval = DatumGetInt32(constval->constvalue);
+        value = psprintf("%d", intval);
+    } else if (typid == INT8OID) {
+        int64 intval = DatumGetInt64(constval->constvalue);
+        value = psprintf("%ld", (long) intval);
+    } else {
+        /* For other types, use output function */
+        Oid typoutput;
+        bool typIsVarlena;
+        getTypeOutputInfo(typid, &typoutput, &typIsVarlena);
+        value = OidOutputFunctionCall(typoutput, constval->constvalue);
+    }
+
+    *out_attnum = var->varattno;
+    *out_value = value;
+    return true;
+}
+
 } // anonymous namespace
 
 extern "C" {
@@ -240,6 +389,9 @@ levelPivotGetForeignPaths(PlannerInfo *root,
 /*
  * GetForeignPlan
  *      Create a ForeignScan plan node
+ *
+ * Extracts equality conditions on identity columns for filter pushdown.
+ * The fdw_private list stores (attnum, value) pairs for pushable filters.
  */
 ForeignScan *
 levelPivotGetForeignPlan(PlannerInfo *root,
@@ -251,17 +403,70 @@ levelPivotGetForeignPlan(PlannerInfo *root,
                          Plan *outer_plan)
 {
     Index scan_relid = baserel->relid;
+    List *fdw_private = NIL;
 
-    /* Remove pseudoconstant clauses */
+    /*
+     * Get the key pattern to determine identity columns.
+     * We need to know which columns are identity columns to determine
+     * which filters can be pushed down.
+     */
+    ForeignTable *table = GetForeignTable(foreigntableid);
+    std::string key_pattern = get_table_option(table, "key_pattern");
+
+    if (!key_pattern.empty()) {
+        /* Parse the key pattern to get capture names */
+        level_pivot::KeyPattern pattern(key_pattern);
+        const auto& capture_names = pattern.capture_names();
+
+        /* Build a map from column name to attnum for identity columns */
+        RangeTblEntry *rte = planner_rt_fetch(baserel->relid, root);
+        Relation rel = table_open(rte->relid, NoLock);
+        TupleDesc tupdesc = RelationGetDescr(rel);
+
+        /* Collect attnums of identity columns */
+        std::vector<AttrNumber> identity_attnums;
+        for (int i = 0; i < tupdesc->natts; i++) {
+            Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+            if (attr->attisdropped)
+                continue;
+
+            std::string col_name = NameStr(attr->attname);
+            for (const auto& cap_name : capture_names) {
+                if (col_name == cap_name) {
+                    identity_attnums.push_back(attr->attnum);
+                    break;
+                }
+            }
+        }
+        table_close(rel, NoLock);
+
+        /* Extract pushable equality conditions from scan_clauses */
+        ListCell *cell;
+        foreach(cell, scan_clauses) {
+            RestrictInfo *rinfo = lfirst_node(RestrictInfo, cell);
+            Expr *clause = rinfo->clause;
+
+            AttrNumber attnum;
+            char *value;
+            if (is_pushable_equality(clause, baserel, identity_attnums,
+                                     &attnum, &value)) {
+                /* Store (attnum, value) pair in fdw_private */
+                fdw_private = lappend(fdw_private, makeInteger(attnum));
+                fdw_private = lappend(fdw_private, makeString(pstrdup(value)));
+            }
+        }
+    }
+
+    /* Remove pseudoconstant clauses - all clauses still checked by PostgreSQL */
     scan_clauses = extract_actual_clauses(scan_clauses, false);
 
     return make_foreignscan(tlist,
                            scan_clauses,
                            scan_relid,
-                           NIL,     /* no expressions to evaluate */
-                           NIL,     /* no private data */
-                           NIL,     /* no custom tlist */
-                           NIL,     /* no remote quals */
+                           NIL,         /* no expressions to evaluate */
+                           fdw_private, /* pushed filter info */
+                           NIL,         /* no custom tlist */
+                           NIL,         /* no remote quals */
                            outer_plan);
 }
 
@@ -280,6 +485,7 @@ levelPivotBeginForeignScan(ForeignScanState *node, int eflags)
         Relation rel = node->ss.ss_currentRelation;
         ForeignTable *table = GetForeignTable(RelationGetRelid(rel));
         ForeignServer *server = GetForeignServer(table->serverid);
+        ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
 
         /* Get options */
         auto conn_options = get_server_options(server);
@@ -309,8 +515,12 @@ levelPivotBeginForeignScan(ForeignScanState *node, int eflags)
                                                     "level_pivot temp",
                                                     ALLOCSET_DEFAULT_SIZES);
 
-        /* Begin scan */
-        state->scanner->begin_scan();
+        /* Build prefix values from fdw_private for filter pushdown */
+        state->prefix_values = build_prefix_from_fdw_private(
+            fsplan->fdw_private, *state->projection);
+
+        /* Begin scan with prefix filter */
+        state->scanner->begin_scan(state->prefix_values);
 
         node->fdw_state = state;
     });
@@ -366,7 +576,8 @@ levelPivotReScanForeignScan(ForeignScanState *node)
     auto state = static_cast<LevelPivotScanState *>(node->fdw_state);
 
     PG_TRY_CPP({
-        state->scanner->rescan();
+        /* Rescan with the same prefix values for filter pushdown */
+        state->scanner->begin_scan(state->prefix_values);
     });
 }
 
@@ -397,6 +608,53 @@ void
 levelPivotExplainForeignScan(ForeignScanState *node, ExplainState *es)
 {
     auto state = static_cast<LevelPivotScanState *>(node->fdw_state);
+
+    /* Show pushed filters even without ANALYZE */
+    ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
+    if (fsplan->fdw_private != NIL) {
+        /*
+         * Build a description of pushed filters from fdw_private.
+         * Need to map attnums back to column names.
+         */
+        Relation rel = node->ss.ss_currentRelation;
+        TupleDesc tupdesc = RelationGetDescr(rel);
+
+        std::string filters;
+        List *fdw_private = fsplan->fdw_private;
+        ListCell *cell = list_head(fdw_private);
+
+        while (cell != NULL) {
+            AttrNumber attnum = intVal(lfirst(cell));
+            cell = lnext(fdw_private, cell);
+            if (cell == NULL)
+                break;
+            char *value = strVal(lfirst(cell));
+            cell = lnext(fdw_private, cell);
+
+            /* Find column name for this attnum */
+            const char *colname = NULL;
+            for (int i = 0; i < tupdesc->natts; i++) {
+                Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+                if (attr->attnum == attnum) {
+                    colname = NameStr(attr->attname);
+                    break;
+                }
+            }
+
+            if (colname) {
+                if (!filters.empty())
+                    filters += ", ";
+                filters += colname;
+                filters += "='";
+                filters += value;
+                filters += "'";
+            }
+        }
+
+        if (!filters.empty()) {
+            ExplainPropertyText("LevelDB Prefix Filter", filters.c_str(), es);
+        }
+    }
 
     if (state && state->scanner)
     {
