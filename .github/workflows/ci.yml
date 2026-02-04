@@ -42,15 +42,15 @@ jobs:
           sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
           sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
           sudo apt-get update
-          sudo apt-get install -y postgresql-16 postgresql-server-dev-16
+          sudo apt-get install -y postgresql-18 postgresql-server-dev-18
 
       - name: Install PostgreSQL (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install postgresql16 --params '/Password:postgres' -y
-          echo "PostgreSQL_ROOT=C:\Program Files\PostgreSQL\16" >> $env:GITHUB_ENV
-          echo "C:\Program Files\PostgreSQL\16\bin" >> $env:GITHUB_PATH
+          choco install postgresql18 --params '/Password:postgres' -y
+          echo "PostgreSQL_ROOT=C:\Program Files\PostgreSQL\18" >> $env:GITHUB_ENV
+          echo "C:\Program Files\PostgreSQL\18\bin" >> $env:GITHUB_PATH
 
       - name: Configure CMake (Linux)
         if: runner.os == 'Linux'
@@ -62,9 +62,9 @@ jobs:
         shell: pwsh
         run: |
           cmake --preset release `
-            -DPostgreSQL_ROOT="C:\Program Files\PostgreSQL\16" `
-            -DPostgreSQL_INCLUDE_DIR="C:\Program Files\PostgreSQL\16\include" `
-            -DPostgreSQL_LIBRARY="C:\Program Files\PostgreSQL\16\lib\postgres.lib"
+            -DPostgreSQL_ROOT="C:\Program Files\PostgreSQL\18" `
+            -DPostgreSQL_INCLUDE_DIR="C:\Program Files\PostgreSQL\18\include" `
+            -DPostgreSQL_LIBRARY="C:\Program Files\PostgreSQL\18\lib\postgres.lib"
 
       - name: Build
         run: cmake --build build/release --config Release
