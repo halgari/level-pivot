@@ -195,28 +195,4 @@ int Projection::attr_column_index(const std::string& attr_name) const {
     return -1;
 }
 
-// ProjectionBuilder implementation
-
-ProjectionBuilder::ProjectionBuilder(const std::string& key_pattern)
-    : pattern_(key_pattern) {}
-
-ProjectionBuilder::ProjectionBuilder(const KeyPattern& pattern)
-    : pattern_(pattern) {}
-
-ProjectionBuilder& ProjectionBuilder::add_identity(const std::string& name,
-                                                   PgType type, int attnum) {
-    columns_.push_back(ColumnDef{name, type, attnum, true});
-    return *this;
-}
-
-ProjectionBuilder& ProjectionBuilder::add_attr(const std::string& attr_name,
-                                               PgType type, int attnum) {
-    columns_.push_back(ColumnDef{attr_name, type, attnum, false});
-    return *this;
-}
-
-Projection ProjectionBuilder::build() const {
-    return Projection(pattern_, columns_);
-}
-
 } // namespace level_pivot

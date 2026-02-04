@@ -160,32 +160,4 @@ private:
     void validate() const;
 };
 
-/**
- * Builder for creating Projection objects
- */
-class ProjectionBuilder {
-public:
-    explicit ProjectionBuilder(const std::string& key_pattern);
-    explicit ProjectionBuilder(const KeyPattern& pattern);
-
-    /**
-     * Add an identity column
-     */
-    ProjectionBuilder& add_identity(const std::string& name, PgType type, int attnum);
-
-    /**
-     * Add an attr column
-     */
-    ProjectionBuilder& add_attr(const std::string& attr_name, PgType type, int attnum);
-
-    /**
-     * Build the projection
-     */
-    Projection build() const;
-
-private:
-    KeyPattern pattern_;
-    std::vector<ColumnDef> columns_;
-};
-
 } // namespace level_pivot

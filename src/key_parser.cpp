@@ -30,10 +30,40 @@ bool KeyParser::matches(const std::string& key) const {
     return parse(key).has_value();
 }
 
-std::optional<ParsedKey> KeyParser::parse(const std::string& key) const {
-    const auto& segments = pattern_.segments();
-    ParsedKey result;
-    result.capture_values.reserve(pattern_.capture_count());
+namespace {
+
+// Unified parsing implementation that works for both ParsedKey and ParsedKeyView
+// Uses a policy-based approach to handle type differences
+template<typename ResultType>
+struct ParsePolicy;
+
+template<>
+struct ParsePolicy<ParsedKey> {
+    using StringType = std::string;
+    static void add_capture(ParsedKey& result, std::string_view key, size_t pos, size_t len) {
+        result.capture_values.emplace_back(key.substr(pos, len));
+    }
+    static void set_attr(ParsedKey& result, std::string_view key, size_t pos, size_t len) {
+        result.attr_name = std::string(key.substr(pos, len));
+    }
+};
+
+template<>
+struct ParsePolicy<ParsedKeyView> {
+    using StringType = std::string_view;
+    static void add_capture(ParsedKeyView& result, std::string_view key, size_t pos, size_t len) {
+        result.capture_values.push_back(key.substr(pos, len));
+    }
+    static void set_attr(ParsedKeyView& result, std::string_view key, size_t pos, size_t len) {
+        result.attr_name = key.substr(pos, len);
+    }
+};
+
+template<typename ResultType>
+std::optional<ResultType> parse_impl(const KeyPattern& pattern, std::string_view key) {
+    const auto& segments = pattern.segments();
+    ResultType result;
+    result.capture_values.reserve(pattern.capture_count());
 
     size_t key_pos = 0;
 
@@ -43,65 +73,53 @@ std::optional<ParsedKey> KeyParser::parse(const std::string& key) const {
         if (std::holds_alternative<LiteralSegment>(segment)) {
             const auto& literal = std::get<LiteralSegment>(segment);
 
-            // Check if key has this literal at current position
             if (key.compare(key_pos, literal.text.size(), literal.text) != 0) {
-                return std::nullopt;  // Literal doesn't match
+                return std::nullopt;
             }
             key_pos += literal.text.size();
 
         } else if (std::holds_alternative<CaptureSegment>(segment)) {
-            // Find the end of this capture (next literal or end of key)
             size_t end_pos;
 
             if (seg_idx + 1 < segments.size()) {
-                // Next segment must be a literal (validated in KeyPattern)
                 const auto& next_literal = std::get<LiteralSegment>(segments[seg_idx + 1]);
-
-                // Find next occurrence of the delimiter
                 end_pos = key.find(next_literal.text, key_pos);
-                if (end_pos == std::string::npos) {
-                    return std::nullopt;  // Delimiter not found
-                }
-            } else {
-                // This is the last segment, capture to end
-                end_pos = key.size();
-            }
-
-            // Empty captures are not allowed
-            if (end_pos == key_pos) {
-                return std::nullopt;
-            }
-
-            result.capture_values.push_back(key.substr(key_pos, end_pos - key_pos));
-            key_pos = end_pos;
-
-        } else if (std::holds_alternative<AttrSegment>(segment)) {
-            // Find the end of attr (next literal or end of key)
-            size_t end_pos;
-
-            if (seg_idx + 1 < segments.size()) {
-                // Next segment must be a literal (validated in KeyPattern)
-                const auto& next_literal = std::get<LiteralSegment>(segments[seg_idx + 1]);
-
-                end_pos = key.find(next_literal.text, key_pos);
-                if (end_pos == std::string::npos) {
+                if (end_pos == std::string_view::npos) {
                     return std::nullopt;
                 }
             } else {
                 end_pos = key.size();
             }
 
-            // Empty attr is not allowed
             if (end_pos == key_pos) {
                 return std::nullopt;
             }
 
-            result.attr_name = key.substr(key_pos, end_pos - key_pos);
+            ParsePolicy<ResultType>::add_capture(result, key, key_pos, end_pos - key_pos);
+            key_pos = end_pos;
+
+        } else if (std::holds_alternative<AttrSegment>(segment)) {
+            size_t end_pos;
+
+            if (seg_idx + 1 < segments.size()) {
+                const auto& next_literal = std::get<LiteralSegment>(segments[seg_idx + 1]);
+                end_pos = key.find(next_literal.text, key_pos);
+                if (end_pos == std::string_view::npos) {
+                    return std::nullopt;
+                }
+            } else {
+                end_pos = key.size();
+            }
+
+            if (end_pos == key_pos) {
+                return std::nullopt;
+            }
+
+            ParsePolicy<ResultType>::set_attr(result, key, key_pos, end_pos - key_pos);
             key_pos = end_pos;
         }
     }
 
-    // Key must be fully consumed
     if (key_pos != key.size()) {
         return std::nullopt;
     }
@@ -109,83 +127,14 @@ std::optional<ParsedKey> KeyParser::parse(const std::string& key) const {
     return result;
 }
 
+} // anonymous namespace
+
+std::optional<ParsedKey> KeyParser::parse(const std::string& key) const {
+    return parse_impl<ParsedKey>(pattern_, key);
+}
+
 std::optional<ParsedKeyView> KeyParser::parse_view(std::string_view key) const {
-    const auto& segments = pattern_.segments();
-    ParsedKeyView result;
-    result.capture_values.reserve(pattern_.capture_count());
-
-    size_t key_pos = 0;
-
-    for (size_t seg_idx = 0; seg_idx < segments.size(); ++seg_idx) {
-        const auto& segment = segments[seg_idx];
-
-        if (std::holds_alternative<LiteralSegment>(segment)) {
-            const auto& literal = std::get<LiteralSegment>(segment);
-
-            // Check if key has this literal at current position
-            if (key.compare(key_pos, literal.text.size(), literal.text) != 0) {
-                return std::nullopt;  // Literal doesn't match
-            }
-            key_pos += literal.text.size();
-
-        } else if (std::holds_alternative<CaptureSegment>(segment)) {
-            // Find the end of this capture (next literal or end of key)
-            size_t end_pos;
-
-            if (seg_idx + 1 < segments.size()) {
-                // Next segment must be a literal (validated in KeyPattern)
-                const auto& next_literal = std::get<LiteralSegment>(segments[seg_idx + 1]);
-
-                // Find next occurrence of the delimiter
-                end_pos = key.find(next_literal.text, key_pos);
-                if (end_pos == std::string_view::npos) {
-                    return std::nullopt;  // Delimiter not found
-                }
-            } else {
-                // This is the last segment, capture to end
-                end_pos = key.size();
-            }
-
-            // Empty captures are not allowed
-            if (end_pos == key_pos) {
-                return std::nullopt;
-            }
-
-            result.capture_values.push_back(key.substr(key_pos, end_pos - key_pos));
-            key_pos = end_pos;
-
-        } else if (std::holds_alternative<AttrSegment>(segment)) {
-            // Find the end of attr (next literal or end of key)
-            size_t end_pos;
-
-            if (seg_idx + 1 < segments.size()) {
-                // Next segment must be a literal (validated in KeyPattern)
-                const auto& next_literal = std::get<LiteralSegment>(segments[seg_idx + 1]);
-
-                end_pos = key.find(next_literal.text, key_pos);
-                if (end_pos == std::string_view::npos) {
-                    return std::nullopt;
-                }
-            } else {
-                end_pos = key.size();
-            }
-
-            // Empty attr is not allowed
-            if (end_pos == key_pos) {
-                return std::nullopt;
-            }
-
-            result.attr_name = key.substr(key_pos, end_pos - key_pos);
-            key_pos = end_pos;
-        }
-    }
-
-    // Key must be fully consumed
-    if (key_pos != key.size()) {
-        return std::nullopt;
-    }
-
-    return result;
+    return parse_impl<ParsedKeyView>(pattern_, key);
 }
 
 std::string KeyParser::build(const std::vector<std::string>& capture_values,

@@ -399,27 +399,4 @@ private:
     detail::FindDelimitersFn find_delimiters_;
 };
 
-/**
- * Even faster: compile pattern to direct offsets for fixed-structure keys
- *
- * For patterns where capture lengths are known or bounded, we can
- * avoid searching entirely and just validate at known positions.
- */
-class CompiledKeyParser {
-public:
-    struct Segment {
-        enum Type { LITERAL, CAPTURE, ATTR };
-        Type type;
-        size_t offset;      // Offset from key start (for literals)
-        size_t length;      // Length (for literals)
-        std::string_view text;  // For literals
-    };
-
-    // Build from pattern analysis
-    static CompiledKeyParser compile(std::string_view pattern);
-
-private:
-    std::vector<Segment> segments_;
-};
-
 } // namespace level_pivot
