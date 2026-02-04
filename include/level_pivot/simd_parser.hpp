@@ -7,14 +7,225 @@
 #include <cstring>
 
 #if defined(__x86_64__) || defined(_M_X64)
+#define LEVEL_PIVOT_X86_64 1
 #include <immintrin.h>
-#define LEVEL_PIVOT_HAS_SSE2 1
-#if defined(__AVX2__)
-#define LEVEL_PIVOT_HAS_AVX2 1
+#if defined(_MSC_VER)
+#include <intrin.h>
 #endif
 #endif
 
 namespace level_pivot {
+
+// =============================================================================
+// CPU Feature Detection (runs once, cached)
+// =============================================================================
+
+namespace detail {
+
+struct CpuFeatures {
+    bool has_sse2 = false;
+    bool has_avx2 = false;
+
+    static const CpuFeatures& get() {
+        static const CpuFeatures instance = detect();
+        return instance;
+    }
+
+private:
+    static CpuFeatures detect() {
+        CpuFeatures f;
+#if defined(LEVEL_PIVOT_X86_64)
+#if defined(_MSC_VER)
+        int cpuInfo[4];
+        __cpuid(cpuInfo, 0);
+        int nIds = cpuInfo[0];
+
+        if (nIds >= 1) {
+            __cpuid(cpuInfo, 1);
+            f.has_sse2 = (cpuInfo[3] & (1 << 26)) != 0;
+        }
+        if (nIds >= 7) {
+            __cpuidex(cpuInfo, 7, 0);
+            f.has_avx2 = (cpuInfo[1] & (1 << 5)) != 0;
+        }
+#else
+        // GCC/Clang
+        __builtin_cpu_init();
+        f.has_sse2 = __builtin_cpu_supports("sse2");
+        f.has_avx2 = __builtin_cpu_supports("avx2");
+#endif
+#endif
+        return f;
+    }
+};
+
+} // namespace detail
+
+// =============================================================================
+// SIMD Implementation Functions (with target attributes for runtime dispatch)
+// =============================================================================
+
+namespace detail {
+
+// Scalar implementation (always available)
+inline void find_delimiters_scalar(
+    const char* data, size_t len, size_t start,
+    char d0, char d1, size_t delim_len,
+    size_t* positions, size_t& count, size_t max_count)
+{
+    if (delim_len == 2) {
+        size_t i = start;
+        count = 0;
+        while (i + 1 < len && count < max_count) {
+            if (data[i] == d0 && data[i + 1] == d1) {
+                positions[count++] = i;
+                i += 2;
+            } else {
+                ++i;
+            }
+        }
+    } else {
+        // General case - use string_view::find
+        std::string_view key(data, len);
+        std::string_view delim(&d0, delim_len);
+        size_t pos = start;
+        count = 0;
+        while ((pos = key.find(delim, pos)) != std::string_view::npos && count < max_count) {
+            positions[count++] = pos;
+            pos += delim_len;
+        }
+    }
+}
+
+#if defined(LEVEL_PIVOT_X86_64)
+
+// SSE2 implementation
+#if defined(_MSC_VER)
+inline void find_delimiters_sse2(
+#else
+__attribute__((target("sse2")))
+inline void find_delimiters_sse2(
+#endif
+    const char* data, size_t len, size_t start,
+    char d0, char d1, size_t delim_len,
+    size_t* positions, size_t& count, size_t max_count)
+{
+    if (delim_len != 2) {
+        find_delimiters_scalar(data, len, start, d0, d1, delim_len, positions, count, max_count);
+        return;
+    }
+
+    __m128i vd0 = _mm_set1_epi8(d0);
+    size_t i = start;
+    count = 0;
+
+    while (i + 16 <= len && count < max_count) {
+        __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i));
+        __m128i eq0 = _mm_cmpeq_epi8(chunk, vd0);
+        uint32_t mask0 = static_cast<uint32_t>(_mm_movemask_epi8(eq0));
+
+        while (mask0 && count < max_count) {
+#if defined(_MSC_VER)
+            unsigned long bit_pos;
+            _BitScanForward(&bit_pos, mask0);
+#else
+            uint32_t bit_pos = static_cast<uint32_t>(__builtin_ctz(mask0));
+#endif
+            size_t pos = i + bit_pos;
+
+            if (pos + 1 < len && data[pos + 1] == d1) {
+                positions[count++] = pos;
+            }
+            mask0 &= mask0 - 1;
+        }
+        i += 16;
+    }
+
+    // Handle tail
+    while (i + 1 < len && count < max_count) {
+        if (data[i] == d0 && data[i + 1] == d1) {
+            positions[count++] = i;
+        }
+        ++i;
+    }
+}
+
+// AVX2 implementation
+#if defined(_MSC_VER)
+inline void find_delimiters_avx2(
+#else
+__attribute__((target("avx2")))
+inline void find_delimiters_avx2(
+#endif
+    const char* data, size_t len, size_t start,
+    char d0, char d1, size_t delim_len,
+    size_t* positions, size_t& count, size_t max_count)
+{
+    if (delim_len != 2) {
+        find_delimiters_scalar(data, len, start, d0, d1, delim_len, positions, count, max_count);
+        return;
+    }
+
+    __m256i vd0 = _mm256_set1_epi8(d0);
+    size_t i = start;
+    count = 0;
+
+    while (i + 32 <= len && count < max_count) {
+        __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + i));
+        __m256i eq0 = _mm256_cmpeq_epi8(chunk, vd0);
+        uint32_t mask0 = static_cast<uint32_t>(_mm256_movemask_epi8(eq0));
+
+        while (mask0 && count < max_count) {
+#if defined(_MSC_VER)
+            unsigned long bit_pos;
+            _BitScanForward(&bit_pos, mask0);
+#else
+            uint32_t bit_pos = static_cast<uint32_t>(__builtin_ctz(mask0));
+#endif
+            size_t pos = i + bit_pos;
+
+            if (pos + 1 < len && data[pos + 1] == d1) {
+                positions[count++] = pos;
+            }
+            mask0 &= mask0 - 1;
+        }
+        i += 32;
+    }
+
+    // Handle tail with SSE2 or scalar
+    while (i + 1 < len && count < max_count) {
+        if (data[i] == d0 && data[i + 1] == d1) {
+            positions[count++] = i;
+        }
+        ++i;
+    }
+}
+
+#endif // LEVEL_PIVOT_X86_64
+
+// Function pointer type for delimiter finding
+using FindDelimitersFn = void(*)(
+    const char* data, size_t len, size_t start,
+    char d0, char d1, size_t delim_len,
+    size_t* positions, size_t& count, size_t max_count);
+
+// Runtime dispatcher - selects best implementation once
+inline FindDelimitersFn select_find_delimiters() {
+#if defined(LEVEL_PIVOT_X86_64)
+    const auto& cpu = CpuFeatures::get();
+    if (cpu.has_avx2) return find_delimiters_avx2;
+    if (cpu.has_sse2) return find_delimiters_sse2;
+#endif
+    return find_delimiters_scalar;
+}
+
+// Global function pointer - initialized once on first use
+inline FindDelimitersFn get_find_delimiters() {
+    static const FindDelimitersFn fn = select_find_delimiters();
+    return fn;
+}
+
+} // namespace detail
 
 /**
  * SIMD-optimized key parser for patterns with a single repeated delimiter
@@ -22,8 +233,8 @@ namespace level_pivot {
  * This is a specialized fast-path for common patterns like:
  *   prefix##capture1##capture2##...##attr
  *
- * Uses SSE2/AVX2 to find all delimiter positions in a single pass,
- * then validates the structure.
+ * Uses runtime CPU detection to select SSE2/AVX2/scalar implementation.
+ * Detection happens once at startup; subsequent calls have zero overhead.
  */
 class SimdKeyParser {
 public:
@@ -44,11 +255,12 @@ public:
      * @param num_captures Number of capture segments (not including attr)
      */
     SimdKeyParser(std::string_view prefix, std::string_view delimiter, size_t num_captures)
-        : prefix_(prefix), delimiter_(delimiter), num_captures_(num_captures) {
-        // Pre-compute total delimiters expected: captures + attr = num_captures + 1
-        // But delimiters separate them, so we need num_captures + 1 delimiters
-        // (prefix##cap1##cap2##attr has 3 delimiters for 2 captures)
-        num_delimiters_ = num_captures_ + 1;
+        : prefix_(prefix)
+        , delimiter_(delimiter)
+        , num_captures_(num_captures)
+        , num_delimiters_(num_captures + 1)
+        , find_delimiters_(detail::get_find_delimiters())
+    {
     }
 
     /**
@@ -66,20 +278,15 @@ public:
             }
         }
 
-        // Find all delimiter positions using SIMD
+        // Find all delimiter positions using runtime-selected SIMD
         size_t search_start = prefix_.size();
-
-        // Use stack allocation for delimiter positions (max 16 captures)
         size_t delim_stack[17];
         size_t delim_count = 0;
 
-#if LEVEL_PIVOT_HAS_AVX2
-        find_delimiters_avx2_fast(key, search_start, delim_stack, delim_count, num_delimiters_ + 1);
-#elif LEVEL_PIVOT_HAS_SSE2
-        find_delimiters_sse2_fast(key, search_start, delim_stack, delim_count, num_delimiters_ + 1);
-#else
-        find_delimiters_scalar_fast(key, search_start, delim_stack, delim_count, num_delimiters_ + 1);
-#endif
+        find_delimiters_(
+            key.data(), key.size(), search_start,
+            delimiter_[0], delimiter_.size() > 1 ? delimiter_[1] : '\0', delimiter_.size(),
+            delim_stack, delim_count, num_delimiters_ + 1);
 
         // Validate we found exactly the right number of delimiters
         if (delim_count != num_delimiters_) {
@@ -140,13 +347,10 @@ public:
         size_t delim_stack[17];
         size_t delim_count = 0;
 
-#if LEVEL_PIVOT_HAS_AVX2
-        find_delimiters_avx2_fast(key, search_start, delim_stack, delim_count, num_delimiters_ + 1);
-#elif LEVEL_PIVOT_HAS_SSE2
-        find_delimiters_sse2_fast(key, search_start, delim_stack, delim_count, num_delimiters_ + 1);
-#else
-        find_delimiters_scalar_fast(key, search_start, delim_stack, delim_count, num_delimiters_ + 1);
-#endif
+        find_delimiters_(
+            key.data(), key.size(), search_start,
+            delimiter_[0], delimiter_.size() > 1 ? delimiter_[1] : '\0', delimiter_.size(),
+            delim_stack, delim_count, num_delimiters_ + 1);
 
         if (delim_count != num_delimiters_) {
             return false;
@@ -176,48 +380,15 @@ public:
     }
 
     /**
-     * Parse without prefix validation (for benchmarking delimiter search)
+     * Get the name of the SIMD implementation being used
      */
-    std::optional<Result> parse_after_prefix(std::string_view key, size_t start_pos) const {
-        std::vector<size_t> delim_positions;
-        delim_positions.reserve(num_delimiters_ + 1);
-
-#if LEVEL_PIVOT_HAS_AVX2
-        find_delimiters_avx2(key, start_pos, delim_positions);
-#elif LEVEL_PIVOT_HAS_SSE2
-        find_delimiters_sse2(key, start_pos, delim_positions);
-#else
-        find_delimiters_scalar(key, start_pos, delim_positions);
+    static const char* implementation_name() {
+#if defined(LEVEL_PIVOT_X86_64)
+        const auto& cpu = detail::CpuFeatures::get();
+        if (cpu.has_avx2) return "AVX2";
+        if (cpu.has_sse2) return "SSE2";
 #endif
-
-        if (delim_positions.size() < num_delimiters_) {
-            return std::nullopt;
-        }
-
-        Result result;
-        result.captures.reserve(num_captures_);
-
-        size_t pos = start_pos;
-
-        for (size_t i = 0; i < num_captures_; ++i) {
-            size_t end = delim_positions[i];
-            if (end <= pos) {
-                return std::nullopt;
-            }
-            result.captures.push_back(key.substr(pos, end - pos));
-            pos = end + delimiter_.size();
-        }
-
-        size_t attr_end = (delim_positions.size() > num_captures_)
-            ? delim_positions[num_captures_]
-            : key.size();
-
-        if (attr_end <= pos) {
-            return std::nullopt;
-        }
-        result.attr = key.substr(pos, attr_end - pos);
-
-        return result;
+        return "scalar";
     }
 
 private:
@@ -225,218 +396,7 @@ private:
     std::string_view delimiter_;
     size_t num_captures_;
     size_t num_delimiters_;
-
-    // Fast versions using stack arrays
-#if LEVEL_PIVOT_HAS_AVX2
-    void find_delimiters_avx2_fast(std::string_view key, size_t start,
-                                    size_t* positions, size_t& count, size_t max_count) const {
-        if (delimiter_.size() != 2) {
-            find_delimiters_scalar_fast(key, start, positions, count, max_count);
-            return;
-        }
-
-        const char d0 = delimiter_[0];
-        const char d1 = delimiter_[1];
-        const char* data = key.data();
-        const size_t len = key.size();
-
-        __m256i vd0 = _mm256_set1_epi8(d0);
-
-        size_t i = start;
-        count = 0;
-
-        while (i + 32 <= len && count < max_count) {
-            __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + i));
-            __m256i eq0 = _mm256_cmpeq_epi8(chunk, vd0);
-            uint32_t mask0 = _mm256_movemask_epi8(eq0);
-
-            while (mask0 && count < max_count) {
-                uint32_t bit_pos = __builtin_ctz(mask0);
-                size_t pos = i + bit_pos;
-
-                if (pos + 1 < len && data[pos + 1] == d1) {
-                    positions[count++] = pos;
-                }
-                mask0 &= mask0 - 1;
-            }
-            i += 32;
-        }
-
-        while (i + 1 < len && count < max_count) {
-            if (data[i] == d0 && data[i + 1] == d1) {
-                positions[count++] = i;
-            }
-            ++i;
-        }
-    }
-#endif
-
-#if LEVEL_PIVOT_HAS_SSE2
-    void find_delimiters_sse2_fast(std::string_view key, size_t start,
-                                    size_t* positions, size_t& count, size_t max_count) const {
-        if (delimiter_.size() != 2) {
-            find_delimiters_scalar_fast(key, start, positions, count, max_count);
-            return;
-        }
-
-        const char d0 = delimiter_[0];
-        const char d1 = delimiter_[1];
-        const char* data = key.data();
-        const size_t len = key.size();
-
-        __m128i vd0 = _mm_set1_epi8(d0);
-
-        size_t i = start;
-        count = 0;
-
-        while (i + 16 <= len && count < max_count) {
-            __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i));
-            __m128i eq0 = _mm_cmpeq_epi8(chunk, vd0);
-            uint32_t mask0 = _mm_movemask_epi8(eq0);
-
-            while (mask0 && count < max_count) {
-                uint32_t bit_pos = __builtin_ctz(mask0);
-                size_t pos = i + bit_pos;
-
-                if (pos + 1 < len && data[pos + 1] == d1) {
-                    positions[count++] = pos;
-                }
-                mask0 &= mask0 - 1;
-            }
-            i += 16;
-        }
-
-        while (i + 1 < len && count < max_count) {
-            if (data[i] == d0 && data[i + 1] == d1) {
-                positions[count++] = i;
-            }
-            ++i;
-        }
-    }
-#endif
-
-    void find_delimiters_scalar_fast(std::string_view key, size_t start,
-                                      size_t* positions, size_t& count, size_t max_count) const {
-        size_t pos = start;
-        count = 0;
-        while ((pos = key.find(delimiter_, pos)) != std::string_view::npos && count < max_count) {
-            positions[count++] = pos;
-            pos += delimiter_.size();
-        }
-    }
-
-    // Original vector-based versions (kept for compatibility)
-#if LEVEL_PIVOT_HAS_AVX2
-    void find_delimiters_avx2(std::string_view key, size_t start,
-                               std::vector<size_t>& positions) const {
-        if (delimiter_.size() != 2) {
-            // Fall back to scalar for non-2-byte delimiters
-            find_delimiters_scalar(key, start, positions);
-            return;
-        }
-
-        const char d0 = delimiter_[0];
-        const char d1 = delimiter_[1];
-        const char* data = key.data();
-        const size_t len = key.size();
-
-        // Broadcast delimiter chars to AVX2 registers
-        __m256i vd0 = _mm256_set1_epi8(d0);
-        __m256i vd1 = _mm256_set1_epi8(d1);
-
-        size_t i = start;
-
-        // Process 32 bytes at a time
-        while (i + 32 <= len) {
-            __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + i));
-
-            // Find positions matching first delimiter char
-            __m256i eq0 = _mm256_cmpeq_epi8(chunk, vd0);
-            uint32_t mask0 = _mm256_movemask_epi8(eq0);
-
-            // For each match of first char, check if next char matches
-            while (mask0) {
-                uint32_t bit_pos = __builtin_ctz(mask0);
-                size_t pos = i + bit_pos;
-
-                if (pos + 1 < len && data[pos + 1] == d1) {
-                    positions.push_back(pos);
-                }
-
-                mask0 &= mask0 - 1;  // Clear lowest set bit
-            }
-
-            i += 32;
-        }
-
-        // Handle remaining bytes with scalar
-        while (i + 1 < len) {
-            if (data[i] == d0 && data[i + 1] == d1) {
-                positions.push_back(i);
-            }
-            ++i;
-        }
-    }
-#endif
-
-#if LEVEL_PIVOT_HAS_SSE2
-    void find_delimiters_sse2(std::string_view key, size_t start,
-                               std::vector<size_t>& positions) const {
-        if (delimiter_.size() != 2) {
-            find_delimiters_scalar(key, start, positions);
-            return;
-        }
-
-        const char d0 = delimiter_[0];
-        const char d1 = delimiter_[1];
-        const char* data = key.data();
-        const size_t len = key.size();
-
-        // Broadcast delimiter chars to SSE2 registers
-        __m128i vd0 = _mm_set1_epi8(d0);
-        __m128i vd1 = _mm_set1_epi8(d1);
-
-        size_t i = start;
-
-        // Process 16 bytes at a time
-        while (i + 16 <= len) {
-            __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i));
-
-            __m128i eq0 = _mm_cmpeq_epi8(chunk, vd0);
-            uint32_t mask0 = _mm_movemask_epi8(eq0);
-
-            while (mask0) {
-                uint32_t bit_pos = __builtin_ctz(mask0);
-                size_t pos = i + bit_pos;
-
-                if (pos + 1 < len && data[pos + 1] == d1) {
-                    positions.push_back(pos);
-                }
-
-                mask0 &= mask0 - 1;
-            }
-
-            i += 16;
-        }
-
-        // Handle remaining bytes
-        while (i + 1 < len) {
-            if (data[i] == d0 && data[i + 1] == d1) {
-                positions.push_back(i);
-            }
-            ++i;
-        }
-    }
-#endif
-
-    void find_delimiters_scalar(std::string_view key, size_t start,
-                                 std::vector<size_t>& positions) const {
-        size_t pos = start;
-        while ((pos = key.find(delimiter_, pos)) != std::string_view::npos) {
-            positions.push_back(pos);
-            pos += delimiter_.size();
-        }
-    }
+    detail::FindDelimitersFn find_delimiters_;
 };
 
 /**
