@@ -29,6 +29,8 @@ if(BASH_EXECUTABLE)
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
         COMMENT "Running integration tests"
     )
+    # Add benchmark subdirectory
+    add_subdirectory(benchmark)
 else()
     message(STATUS "Bash not found, skipping integration tests")
 endif()
