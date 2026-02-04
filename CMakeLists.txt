@@ -43,6 +43,14 @@ target_include_directories(level_pivot_core PUBLIC
     ${PostgreSQL_SERVER_INCLUDE_DIRS}
 )
 
+# Add PostgreSQL's Windows port directories for Unix header compatibility
+if(WIN32)
+    target_include_directories(level_pivot_core PUBLIC
+        ${PostgreSQL_SERVER_INCLUDE_DIRS}/port/win32
+        ${PostgreSQL_SERVER_INCLUDE_DIRS}/port/win32_msvc
+    )
+endif()
+
 target_link_libraries(level_pivot_core PUBLIC
     ${LEVELDB_TARGET}
 )
