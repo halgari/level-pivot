@@ -5,10 +5,12 @@ namespace level_pivot {
 
 KeyParser::KeyParser(const KeyPattern& pattern) : pattern_(pattern) {
     compute_estimated_key_size();
+    try_init_simd_parser();
 }
 
 KeyParser::KeyParser(const std::string& pattern) : pattern_(pattern) {
     compute_estimated_key_size();
+    try_init_simd_parser();
 }
 
 void KeyParser::compute_estimated_key_size() {
@@ -134,6 +136,21 @@ std::optional<ParsedKey> KeyParser::parse(const std::string& key) const {
 }
 
 std::optional<ParsedKeyView> KeyParser::parse_view(std::string_view key) const {
+    // Use SIMD parser if available (uniform delimiter pattern)
+    if (simd_parser_) {
+        std::string_view captures[16];  // Stack-allocated, max 16 captures
+        std::string_view attr;
+        if (simd_parser_->parse_fast(key, captures, attr)) {
+            ParsedKeyView result;
+            result.capture_values.reserve(pattern_.capture_count());
+            for (size_t i = 0; i < pattern_.capture_count(); ++i) {
+                result.capture_values.push_back(captures[i]);
+            }
+            result.attr_name = attr;
+            return result;
+        }
+        return std::nullopt;
+    }
     return parse_impl<ParsedKeyView>(pattern_, key);
 }
 
@@ -223,6 +240,58 @@ bool KeyParser::starts_with_prefix(const std::string& key) const {
         return false;
     }
     return key.compare(0, prefix.size(), prefix) == 0;
+}
+
+std::optional<std::string> KeyParser::try_get_uniform_delimiter() const {
+    std::string delimiter;
+    bool first_literal = true;
+
+    for (size_t i = 0; i < pattern_.segments().size(); ++i) {
+        const auto& seg = pattern_.segments()[i];
+
+        if (std::holds_alternative<LiteralSegment>(seg)) {
+            const auto& lit = std::get<LiteralSegment>(seg).text;
+
+            // Skip prefix literal (first literal before any capture)
+            if (first_literal && i == 0) {
+                first_literal = false;
+                continue;
+            }
+
+            if (delimiter.empty()) {
+                delimiter = lit;
+            } else if (delimiter != lit) {
+                return std::nullopt;  // Non-uniform delimiters
+            }
+        } else {
+            // We hit a capture or attr segment
+            if (first_literal) {
+                // Pattern starts with capture, no prefix
+                first_literal = false;
+            }
+        }
+    }
+
+    return delimiter.empty() ? std::nullopt : std::optional(delimiter);
+}
+
+void KeyParser::try_init_simd_parser() {
+    // Check if pattern has uniform delimiters
+    auto uniform_delim = try_get_uniform_delimiter();
+    if (!uniform_delim) {
+        return;  // Non-uniform delimiters, can't use SIMD
+    }
+
+    // Store owned copies of strings for SIMD parser
+    simd_prefix_ = pattern_.literal_prefix();
+    simd_delimiter_ = *uniform_delim;
+
+    // Create SIMD parser with stable string_views to our owned strings
+    simd_parser_ = std::make_unique<SimdKeyParser>(
+        simd_prefix_,
+        simd_delimiter_,
+        pattern_.capture_count()
+    );
 }
 
 } // namespace level_pivot

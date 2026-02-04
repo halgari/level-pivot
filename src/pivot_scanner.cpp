@@ -30,10 +30,11 @@ void PivotScanner::begin_scan(const std::vector<std::string>& prefix_values) {
 
 std::optional<PivotRow> PivotScanner::next_row() {
     while (iterator_ && iterator_->valid()) {
-        std::string key = iterator_->key();
+        // Zero-copy: get key as string_view
+        std::string_view key_sv = iterator_->key_view();
 
         // Check if we're still within the prefix
-        if (!is_within_prefix(key)) {
+        if (!is_within_prefix_view(key_sv)) {
             // Emit any accumulated row before stopping
             if (current_identity_.has_value()) {
                 return emit_current_row();
@@ -43,8 +44,8 @@ std::optional<PivotRow> PivotScanner::next_row() {
 
         ++stats_.keys_scanned;
 
-        // Try to parse the key
-        auto parsed = projection_.parser().parse(key);
+        // Zero-copy parse using string_view
+        auto parsed = projection_.parser().parse_view(key_sv);
         if (!parsed) {
             ++stats_.keys_skipped;
             iterator_->next();
@@ -53,19 +54,19 @@ std::optional<PivotRow> PivotScanner::next_row() {
 
         // Check if this is the same row or a new one
         if (!current_identity_.has_value()) {
-            // First row
-            current_identity_ = parsed->capture_values;
+            // First row - materialize identity strings
+            current_identity_ = materialize_identity(parsed->capture_values);
             current_attrs_.clear();
-        } else if (*current_identity_ != parsed->capture_values) {
+        } else if (!identity_matches(*current_identity_, parsed->capture_values)) {
             // Identity changed - emit the previous row and start a new one
             auto row = emit_current_row();
-            current_identity_ = parsed->capture_values;
+            current_identity_ = materialize_identity(parsed->capture_values);
             current_attrs_.clear();
 
             // Accumulate this key into the new row
-            std::string attr_name = parsed->attr_name;
+            std::string attr_name(parsed->attr_name);
             if (projection_.has_attr(attr_name)) {
-                current_attrs_[attr_name] = iterator_->value();
+                current_attrs_[attr_name] = std::string(iterator_->value_view());
             }
 
             iterator_->next();
@@ -73,9 +74,9 @@ std::optional<PivotRow> PivotScanner::next_row() {
         }
 
         // Accumulate this key into the current row
-        std::string attr_name = parsed->attr_name;
+        std::string attr_name(parsed->attr_name);
         if (projection_.has_attr(attr_name)) {
-            current_attrs_[attr_name] = iterator_->value();
+            current_attrs_[attr_name] = std::string(iterator_->value_view());
         }
 
         iterator_->next();
@@ -104,6 +105,40 @@ bool PivotScanner::is_within_prefix(const std::string& key) const {
         return true;
     }
     return key.compare(0, prefix_.size(), prefix_) == 0;
+}
+
+bool PivotScanner::is_within_prefix_view(std::string_view key) const {
+    if (prefix_.empty()) {
+        return true;
+    }
+    if (key.size() < prefix_.size()) {
+        return false;
+    }
+    return key.substr(0, prefix_.size()) == prefix_;
+}
+
+std::vector<std::string> PivotScanner::materialize_identity(
+    const std::vector<std::string_view>& views) {
+    std::vector<std::string> result;
+    result.reserve(views.size());
+    for (const auto& sv : views) {
+        result.emplace_back(sv);
+    }
+    return result;
+}
+
+bool PivotScanner::identity_matches(
+    const std::vector<std::string>& identity,
+    const std::vector<std::string_view>& views) {
+    if (identity.size() != views.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < identity.size(); ++i) {
+        if (identity[i] != views[i]) {
+            return false;
+        }
+    }
+    return true;
 }
 
 std::optional<PivotRow> PivotScanner::emit_current_row() {

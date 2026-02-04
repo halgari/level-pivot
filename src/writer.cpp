@@ -1,6 +1,24 @@
 #include "level_pivot/writer.hpp"
+#include <string_view>
 
 namespace level_pivot {
+
+namespace {
+// Helper to compare owned identity with parsed views
+bool identity_matches_views(
+    const std::vector<std::string>& identity,
+    const std::vector<std::string_view>& views) {
+    if (identity.size() != views.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < identity.size(); ++i) {
+        if (identity[i] != views[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+} // anonymous namespace
 
 Writer::Writer(const Projection& projection,
                std::shared_ptr<LevelDBConnection> connection)
@@ -169,17 +187,20 @@ std::vector<std::string> Writer::find_keys_for_identity(
     }
 
     while (iter.valid()) {
-        std::string key = iter.key();
+        // Zero-copy: get key as string_view
+        std::string_view key_sv = iter.key_view();
 
         // Check if still within prefix
-        if (!prefix.empty() && key.compare(0, prefix.size(), prefix) != 0) {
+        if (!prefix.empty() && (key_sv.size() < prefix.size() ||
+            key_sv.substr(0, prefix.size()) != prefix)) {
             break;
         }
 
-        // Parse key to check identity match
-        auto parsed = projection_.parser().parse(key);
-        if (parsed && parsed->capture_values == identity_values) {
-            keys.push_back(key);
+        // Zero-copy parse to check identity match
+        auto parsed = projection_.parser().parse_view(key_sv);
+        if (parsed && identity_matches_views(identity_values, parsed->capture_values)) {
+            // Only materialize when we have a match
+            keys.emplace_back(key_sv);
         }
 
         iter.next();

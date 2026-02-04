@@ -4,6 +4,7 @@
 #include <leveldb/options.h>
 #include <leveldb/iterator.h>
 #include <leveldb/write_batch.h>
+#include <string_view>
 
 namespace level_pivot {
 
@@ -47,6 +48,16 @@ std::string LevelDBIterator::key() const {
 
 std::string LevelDBIterator::value() const {
     return iter_->value().ToString();
+}
+
+std::string_view LevelDBIterator::key_view() const {
+    auto s = iter_->key();
+    return std::string_view(s.data(), s.size());
+}
+
+std::string_view LevelDBIterator::value_view() const {
+    auto s = iter_->value();
+    return std::string_view(s.data(), s.size());
 }
 
 // LevelDBWriteBatch implementation

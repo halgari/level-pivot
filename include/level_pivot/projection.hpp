@@ -156,6 +156,10 @@ private:
     std::unordered_set<std::string> attr_names_;
     std::vector<int> column_to_identity_index_;  // -1 for non-identity columns
 
+    // O(1) lookup maps for identity and attr column indices
+    std::unordered_map<std::string, int> identity_name_to_index_;
+    std::unordered_map<std::string, int> attr_name_to_index_;
+
     void build_indexes();
     void validate() const;
 };

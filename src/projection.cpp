@@ -80,6 +80,8 @@ void Projection::build_indexes() {
     attr_names_.clear();
     column_to_identity_index_.clear();
     column_to_identity_index_.resize(columns_.size(), -1);
+    identity_name_to_index_.clear();
+    attr_name_to_index_.clear();
 
     // Build mapping from capture name to identity index
     const auto& capture_names = parser_.pattern().capture_names();
@@ -95,6 +97,8 @@ void Projection::build_indexes() {
         column_attnum_index_[col.attnum] = i;
 
         if (col.is_identity) {
+            // Build O(1) identity name lookup
+            identity_name_to_index_[col.name] = static_cast<int>(identity_columns_.size());
             identity_columns_.push_back(&columns_[i]);
             // Map column index to identity value index
             auto it = capture_to_index.find(col.name);
@@ -102,6 +106,8 @@ void Projection::build_indexes() {
                 column_to_identity_index_[i] = it->second;
             }
         } else {
+            // Build O(1) attr name lookup
+            attr_name_to_index_[col.name] = static_cast<int>(attr_columns_.size());
             attr_columns_.push_back(&columns_[i]);
             attr_names_.insert(col.name);
         }
@@ -178,21 +184,13 @@ const ColumnDef* Projection::column_by_attnum(int attnum) const {
 }
 
 int Projection::identity_column_index(const std::string& capture_name) const {
-    for (size_t i = 0; i < identity_columns_.size(); ++i) {
-        if (identity_columns_[i]->name == capture_name) {
-            return static_cast<int>(i);
-        }
-    }
-    return -1;
+    auto it = identity_name_to_index_.find(capture_name);
+    return it != identity_name_to_index_.end() ? it->second : -1;
 }
 
 int Projection::attr_column_index(const std::string& attr_name) const {
-    for (size_t i = 0; i < attr_columns_.size(); ++i) {
-        if (attr_columns_[i]->name == attr_name) {
-            return static_cast<int>(i);
-        }
-    }
-    return -1;
+    auto it = attr_name_to_index_.find(attr_name);
+    return it != attr_name_to_index_.end() ? it->second : -1;
 }
 
 } // namespace level_pivot

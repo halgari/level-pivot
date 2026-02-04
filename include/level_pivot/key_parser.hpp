@@ -1,11 +1,13 @@
 #pragma once
 
 #include "level_pivot/key_pattern.hpp"
+#include "level_pivot/simd_parser.hpp"
 #include <string>
 #include <string_view>
 #include <vector>
 #include <optional>
 #include <unordered_map>
+#include <memory>
 
 namespace level_pivot {
 
@@ -150,7 +152,16 @@ private:
     KeyPattern pattern_;
     size_t estimated_key_size_;  // Pre-computed estimate for build() reserve
 
+    // SIMD parser for uniform delimiter patterns (optional)
+    // Stored as unique_ptr to keep SimdKeyParser's storage stable
+    // (since it stores string_view to its own strings)
+    std::unique_ptr<SimdKeyParser> simd_parser_;
+    std::string simd_prefix_;      // Owned storage for SIMD prefix
+    std::string simd_delimiter_;   // Owned storage for SIMD delimiter
+
     void compute_estimated_key_size();
+    void try_init_simd_parser();
+    std::optional<std::string> try_get_uniform_delimiter() const;
 };
 
 } // namespace level_pivot

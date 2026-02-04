@@ -94,8 +94,18 @@ private:
     std::unordered_map<std::string, std::string> current_attrs_;
 
     bool is_within_prefix(const std::string& key) const;
+    bool is_within_prefix_view(std::string_view key) const;
     void accumulate_row();
     std::optional<PivotRow> emit_current_row();
+
+    // Helper to convert string_view identity to owned strings
+    static std::vector<std::string> materialize_identity(
+        const std::vector<std::string_view>& views);
+
+    // Helper to compare owned identity with parsed views
+    static bool identity_matches(
+        const std::vector<std::string>& identity,
+        const std::vector<std::string_view>& views);
 };
 
 /**

@@ -2,6 +2,7 @@
 
 #include "level_pivot/error.hpp"
 #include <string>
+#include <string_view>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -52,6 +53,22 @@ public:
     bool valid() const;
     std::string key() const;
     std::string value() const;
+
+    /**
+     * Get the current key as a string_view (zero-copy)
+     *
+     * WARNING: The returned view is only valid until the iterator moves.
+     * Use key() if you need the value to outlive iterator movement.
+     */
+    std::string_view key_view() const;
+
+    /**
+     * Get the current value as a string_view (zero-copy)
+     *
+     * WARNING: The returned view is only valid until the iterator moves.
+     * Use value() if you need the value to outlive iterator movement.
+     */
+    std::string_view value_view() const;
 
 private:
     std::unique_ptr<leveldb::Iterator> iter_;
