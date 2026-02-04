@@ -87,9 +87,10 @@ struct LevelPivotModifyState {
     std::shared_ptr<level_pivot::LevelDBConnection> connection;
     int num_cols;
     AttrNumber *attr_map;  // Maps foreign column attnums to local slot positions
+    bool use_write_batch;
     bool cleaned_up;
 
-    LevelPivotModifyState() : num_cols(0), attr_map(nullptr), cleaned_up(false) {}
+    LevelPivotModifyState() : num_cols(0), attr_map(nullptr), use_write_batch(true), cleaned_up(false) {}
 
     ~LevelPivotModifyState() { cleanup(); }
 
@@ -98,6 +99,10 @@ struct LevelPivotModifyState {
             return;
         cleaned_up = true;
 
+        // Discard any uncommitted batch operations
+        if (writer && writer->is_batched()) {
+            writer->discard_batch();
+        }
         writer.reset();
         projection.reset();
         connection.reset();
@@ -126,6 +131,8 @@ get_server_options(ForeignServer *server)
             options.block_cache_size = strtoul(defGetString(def), NULL, 10);
         else if (strcmp(def->defname, "write_buffer_size") == 0)
             options.write_buffer_size = strtoul(defGetString(def), NULL, 10);
+        else if (strcmp(def->defname, "use_write_batch") == 0)
+            options.use_write_batch = defGetBoolean(def);
     }
 
     return options;
@@ -473,9 +480,19 @@ levelPivotBeginForeignModify(ModifyTableState *mtstate,
         state->connection = level_pivot::ConnectionManager::instance()
             .get_connection(server->serverid, conn_options);
 
-        /* Create writer */
-        state->writer = std::make_unique<level_pivot::Writer>(
-            *state->projection, state->connection);
+        /* Store write batch setting */
+        state->use_write_batch = conn_options.use_write_batch;
+
+        /* Create writer - with or without batch depending on options */
+        if (conn_options.use_write_batch) {
+            auto batch = std::make_unique<level_pivot::LevelDBWriteBatch>(
+                state->connection->create_batch());
+            state->writer = std::make_unique<level_pivot::Writer>(
+                *state->projection, state->connection, std::move(batch));
+        } else {
+            state->writer = std::make_unique<level_pivot::Writer>(
+                *state->projection, state->connection);
+        }
 
         /* Store column count */
         TupleDesc tupdesc = RelationGetDescr(rel);
@@ -597,6 +614,13 @@ levelPivotEndForeignModify(EState *estate, ResultRelInfo *rinfo)
 
     if (state)
     {
+        PG_TRY_CPP({
+            /* Commit batch if using batched writes */
+            if (state->writer && state->use_write_batch) {
+                state->writer->commit_batch();
+            }
+        });
+
         /* Call cleanup() to release resources early.
          * The destructor will also be called via memory context callback
          * when the modify context is deleted, but cleanup() is idempotent. */

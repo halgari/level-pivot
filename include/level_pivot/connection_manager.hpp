@@ -29,6 +29,7 @@ struct ConnectionOptions {
     bool create_if_missing = false;
     size_t block_cache_size = 8 * 1024 * 1024;  // 8MB default
     size_t write_buffer_size = 4 * 1024 * 1024;  // 4MB default
+    bool use_write_batch = true;  // Use WriteBatch for atomic operations
 };
 
 /**
@@ -55,6 +56,9 @@ public:
 private:
     std::unique_ptr<leveldb::Iterator> iter_;
 };
+
+// Forward declaration for LevelDBWriteBatch
+class LevelDBWriteBatch;
 
 /**
  * RAII wrapper for LevelDB connection
@@ -90,6 +94,11 @@ public:
     LevelDBIterator iterator();
 
     /**
+     * Create a write batch for atomic operations
+     */
+    LevelDBWriteBatch create_batch();
+
+    /**
      * Get the database path
      */
     const std::string& path() const { return path_; }
@@ -110,6 +119,60 @@ private:
     bool read_only_;
 
     void check_write_allowed();
+};
+
+/**
+ * RAII wrapper for LevelDB WriteBatch
+ *
+ * Buffers write operations and commits them atomically.
+ * If not explicitly committed, the destructor discards pending writes.
+ */
+class LevelDBWriteBatch {
+public:
+    explicit LevelDBWriteBatch(LevelDBConnection* connection);
+    ~LevelDBWriteBatch();  // Discards if not committed
+
+    // Move-only
+    LevelDBWriteBatch(LevelDBWriteBatch&& other) noexcept;
+    LevelDBWriteBatch& operator=(LevelDBWriteBatch&& other) noexcept;
+    LevelDBWriteBatch(const LevelDBWriteBatch&) = delete;
+    LevelDBWriteBatch& operator=(const LevelDBWriteBatch&) = delete;
+
+    /**
+     * Add a put operation to the batch
+     */
+    void put(const std::string& key, const std::string& value);
+
+    /**
+     * Add a delete operation to the batch
+     */
+    void del(const std::string& key);
+
+    /**
+     * Commit all operations atomically
+     */
+    void commit();
+
+    /**
+     * Discard all pending operations without writing
+     */
+    void discard();
+
+    /**
+     * Get the number of pending operations
+     */
+    size_t pending_count() const;
+
+    /**
+     * Check if there are pending operations
+     */
+    bool has_pending() const;
+
+private:
+    LevelDBConnection* connection_;
+    std::unique_ptr<leveldb::WriteBatch> batch_;
+    size_t pending_count_ = 0;
+    bool committed_ = false;
 };
 
 /**

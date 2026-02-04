@@ -25,7 +25,8 @@ const std::unordered_set<std::string> server_options = {
     "read_only",
     "create_if_missing",
     "block_cache_size",
-    "write_buffer_size"
+    "write_buffer_size",
+    "use_write_batch"
 };
 
 /* Valid FOREIGN TABLE options */
@@ -72,7 +73,8 @@ void levelPivotValidateOptions(List *options_list, Oid catalog)
                     (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
                      errmsg("invalid option \"%s\" for SERVER", def->defname),
                      errhint("Valid options are: db_path, read_only, "
-                            "create_if_missing, block_cache_size, write_buffer_size")));
+                            "create_if_missing, block_cache_size, write_buffer_size, "
+                            "use_write_batch")));
             }
 
             const char* value = defGetString(def);
@@ -86,7 +88,8 @@ void levelPivotValidateOptions(List *options_list, Oid catalog)
                          errmsg("db_path cannot be empty")));
                 }
             }
-            else if (name == "read_only" || name == "create_if_missing")
+            else if (name == "read_only" || name == "create_if_missing" ||
+                     name == "use_write_batch")
             {
                 if (!is_valid_bool(value))
                 {

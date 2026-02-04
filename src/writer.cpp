@@ -4,7 +4,17 @@ namespace level_pivot {
 
 Writer::Writer(const Projection& projection,
                std::shared_ptr<LevelDBConnection> connection)
-    : projection_(projection), connection_(std::move(connection)) {
+    : projection_(projection), connection_(std::move(connection)), batch_(nullptr) {
+
+    if (connection_->is_read_only()) {
+        throw LevelDBError("Cannot create writer for read-only connection");
+    }
+}
+
+Writer::Writer(const Projection& projection,
+               std::shared_ptr<LevelDBConnection> connection,
+               std::unique_ptr<LevelDBWriteBatch> batch)
+    : projection_(projection), connection_(std::move(connection)), batch_(std::move(batch)) {
 
     if (connection_->is_read_only()) {
         throw LevelDBError("Cannot create writer for read-only connection");
@@ -29,7 +39,7 @@ WriteResult Writer::insert(Datum* values, bool* nulls) {
 
     for (const auto& [attr_name, attr_value] : extracted.values) {
         std::string key = projection_.parser().build(identity, attr_name);
-        connection_->put(key, attr_value);
+        do_put(key, attr_value);
         ++result.keys_written;
     }
 
@@ -68,14 +78,14 @@ WriteResult Writer::update(Datum* old_values, bool* old_nulls,
     // Write non-null attrs
     for (const auto& [attr_name, attr_value] : extracted.values) {
         std::string key = projection_.parser().build(new_identity, attr_name);
-        connection_->put(key, attr_value);
+        do_put(key, attr_value);
         ++result.keys_written;
     }
 
     // Delete attrs that are now null
     for (const auto& attr_name : extracted.null_names) {
         std::string key = projection_.parser().build(new_identity, attr_name);
-        connection_->del(key);
+        do_del(key);
         ++result.keys_deleted;
     }
 
@@ -94,7 +104,7 @@ WriteResult Writer::remove_by_identity(const std::vector<std::string>& identity_
     auto keys = find_keys_for_identity(identity_values);
 
     for (const auto& key : keys) {
-        connection_->del(key);
+        do_del(key);
         ++result.keys_deleted;
     }
 
@@ -176,6 +186,42 @@ std::vector<std::string> Writer::find_keys_for_identity(
     }
 
     return keys;
+}
+
+void Writer::do_put(const std::string& key, const std::string& value) {
+    if (batch_) {
+        batch_->put(key, value);
+    } else {
+        connection_->put(key, value);
+    }
+}
+
+void Writer::do_del(const std::string& key) {
+    if (batch_) {
+        batch_->del(key);
+    } else {
+        connection_->del(key);
+    }
+}
+
+bool Writer::is_batched() const {
+    return batch_ != nullptr;
+}
+
+void Writer::commit_batch() {
+    if (batch_) {
+        batch_->commit();
+    }
+}
+
+void Writer::discard_batch() {
+    if (batch_) {
+        batch_->discard();
+    }
+}
+
+size_t Writer::pending_count() const {
+    return batch_ ? batch_->pending_count() : 0;
 }
 
 } // namespace level_pivot

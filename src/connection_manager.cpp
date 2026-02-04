@@ -49,6 +49,88 @@ std::string LevelDBIterator::value() const {
     return iter_->value().ToString();
 }
 
+// LevelDBWriteBatch implementation
+
+LevelDBWriteBatch::LevelDBWriteBatch(LevelDBConnection* connection)
+    : connection_(connection), batch_(std::make_unique<leveldb::WriteBatch>()) {}
+
+LevelDBWriteBatch::~LevelDBWriteBatch() {
+    if (!committed_) {
+        discard();
+    }
+}
+
+LevelDBWriteBatch::LevelDBWriteBatch(LevelDBWriteBatch&& other) noexcept
+    : connection_(other.connection_),
+      batch_(std::move(other.batch_)),
+      pending_count_(other.pending_count_),
+      committed_(other.committed_) {
+    other.connection_ = nullptr;
+    other.pending_count_ = 0;
+    other.committed_ = true;  // Prevent moved-from object from discarding
+}
+
+LevelDBWriteBatch& LevelDBWriteBatch::operator=(LevelDBWriteBatch&& other) noexcept {
+    if (this != &other) {
+        if (!committed_) {
+            discard();
+        }
+        connection_ = other.connection_;
+        batch_ = std::move(other.batch_);
+        pending_count_ = other.pending_count_;
+        committed_ = other.committed_;
+        other.connection_ = nullptr;
+        other.pending_count_ = 0;
+        other.committed_ = true;
+    }
+    return *this;
+}
+
+void LevelDBWriteBatch::put(const std::string& key, const std::string& value) {
+    batch_->Put(key, value);
+    ++pending_count_;
+}
+
+void LevelDBWriteBatch::del(const std::string& key) {
+    batch_->Delete(key);
+    ++pending_count_;
+}
+
+void LevelDBWriteBatch::commit() {
+    if (committed_) {
+        return;
+    }
+
+    if (connection_ && batch_ && pending_count_ > 0) {
+        leveldb::WriteOptions options;
+        options.sync = false;
+
+        leveldb::Status status = connection_->raw()->Write(options, batch_.get());
+        if (!status.ok()) {
+            throw LevelDBError("WriteBatch commit failed: " + status.ToString());
+        }
+    }
+
+    committed_ = true;
+    pending_count_ = 0;
+}
+
+void LevelDBWriteBatch::discard() {
+    if (batch_) {
+        batch_->Clear();
+    }
+    pending_count_ = 0;
+    committed_ = true;
+}
+
+size_t LevelDBWriteBatch::pending_count() const {
+    return pending_count_;
+}
+
+bool LevelDBWriteBatch::has_pending() const {
+    return pending_count_ > 0;
+}
+
 // LevelDBConnection implementation
 
 LevelDBConnection::LevelDBConnection(const ConnectionOptions& options)
@@ -119,6 +201,11 @@ void LevelDBConnection::del(const std::string& key) {
 
 LevelDBIterator LevelDBConnection::iterator() {
     return LevelDBIterator(db_);
+}
+
+LevelDBWriteBatch LevelDBConnection::create_batch() {
+    check_write_allowed();
+    return LevelDBWriteBatch(this);
 }
 
 void LevelDBConnection::check_write_allowed() {

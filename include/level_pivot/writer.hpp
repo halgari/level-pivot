@@ -42,6 +42,17 @@ public:
            std::shared_ptr<LevelDBConnection> connection);
 
     /**
+     * Create a writer with batched writes
+     *
+     * @param projection Table projection
+     * @param connection LevelDB connection (must be writable)
+     * @param batch WriteBatch for buffering operations
+     */
+    Writer(const Projection& projection,
+           std::shared_ptr<LevelDBConnection> connection,
+           std::unique_ptr<LevelDBWriteBatch> batch);
+
+    /**
      * Insert a new row
      *
      * Creates LevelDB keys for each non-null attr column.
@@ -85,9 +96,34 @@ public:
      */
     WriteResult remove_by_identity(const std::vector<std::string>& identity_values);
 
+    /**
+     * Check if this writer is using batched mode
+     */
+    bool is_batched() const;
+
+    /**
+     * Commit the batch (only valid in batched mode)
+     */
+    void commit_batch();
+
+    /**
+     * Discard the batch without writing (only valid in batched mode)
+     */
+    void discard_batch();
+
+    /**
+     * Get the number of pending operations in the batch
+     */
+    size_t pending_count() const;
+
 private:
     const Projection& projection_;
     std::shared_ptr<LevelDBConnection> connection_;
+    std::unique_ptr<LevelDBWriteBatch> batch_;  // Optional batch for atomic writes
+
+    // Helper methods for routing writes to batch or connection
+    void do_put(const std::string& key, const std::string& value);
+    void do_del(const std::string& key);
 
     // Extracted attribute values and null names in a single struct
     struct ExtractedAttrs {
