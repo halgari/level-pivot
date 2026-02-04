@@ -60,6 +60,7 @@ add_library(level_pivot MODULE
     src/level_pivot_fdw.cpp
     src/fdw_handler.cpp
     src/fdw_validator.cpp
+    src/error.cpp
 )
 
 target_link_libraries(level_pivot PRIVATE

@@ -42,6 +42,7 @@ extern "C" {
 #include "level_pivot/writer.hpp"
 #include "level_pivot/schema_discovery.hpp"
 #include "level_pivot/error.hpp"
+#include "level_pivot/pg_memory.hpp"
 
 #include <memory>
 #include <string>
@@ -49,12 +50,34 @@ extern "C" {
 
 namespace {
 
+/* Type aliases to avoid macro comma issues with templates */
+using DatumTempArray = level_pivot::TempArray<Datum, 64>;
+using BoolTempArray = level_pivot::TempArray<bool, 64>;
+
 /* Scan state structure */
 struct LevelPivotScanState {
     std::unique_ptr<level_pivot::Projection> projection;
     std::unique_ptr<level_pivot::PivotScanner> scanner;
     std::shared_ptr<level_pivot::LevelDBConnection> connection;
     MemoryContext temp_context;
+    bool cleaned_up;
+
+    LevelPivotScanState() : temp_context(nullptr), cleaned_up(false) {}
+
+    ~LevelPivotScanState() { cleanup(); }
+
+    void cleanup() {
+        if (cleaned_up)
+            return;
+        cleaned_up = true;
+
+        if (scanner)
+            scanner->end_scan();
+        scanner.reset();
+        projection.reset();
+        connection.reset();
+        // Note: temp_context is a child of scan_ctx, will be deleted with parent
+    }
 };
 
 /* Modify state structure */
@@ -64,6 +87,21 @@ struct LevelPivotModifyState {
     std::shared_ptr<level_pivot::LevelDBConnection> connection;
     int num_cols;
     AttrNumber *attr_map;  // Maps foreign column attnums to local slot positions
+    bool cleaned_up;
+
+    LevelPivotModifyState() : num_cols(0), attr_map(nullptr), cleaned_up(false) {}
+
+    ~LevelPivotModifyState() { cleanup(); }
+
+    void cleanup() {
+        if (cleaned_up)
+            return;
+        cleaned_up = true;
+
+        writer.reset();
+        projection.reset();
+        connection.reset();
+    }
 };
 
 /* Helper functions */
@@ -240,8 +278,13 @@ levelPivotBeginForeignScan(ForeignScanState *node, int eflags)
         auto conn_options = get_server_options(server);
         std::string key_pattern = get_table_option(table, "key_pattern");
 
-        /* Create scan state */
-        auto state = new LevelPivotScanState();
+        /* Create dedicated memory context for scan state */
+        MemoryContext scan_ctx = AllocSetContextCreate(estate->es_query_cxt,
+                                                       "level_pivot scan",
+                                                       ALLOCSET_DEFAULT_SIZES);
+
+        /* Create scan state using pg_construct for automatic cleanup */
+        auto state = level_pivot::pg_construct<LevelPivotScanState>(scan_ctx);
 
         /* Build projection from table definition */
         state->projection = build_projection_from_relation(rel, key_pattern);
@@ -254,8 +297,8 @@ levelPivotBeginForeignScan(ForeignScanState *node, int eflags)
         state->scanner = std::make_unique<level_pivot::PivotScanner>(
             *state->projection, state->connection);
 
-        /* Create temp memory context */
-        state->temp_context = AllocSetContextCreate(estate->es_query_cxt,
+        /* Create temp memory context as child of scan context */
+        state->temp_context = AllocSetContextCreate(scan_ctx,
                                                     "level_pivot temp",
                                                     ALLOCSET_DEFAULT_SIZES);
 
@@ -331,10 +374,10 @@ levelPivotEndForeignScan(ForeignScanState *node)
 
     if (state)
     {
-        state->scanner->end_scan();
-        if (state->temp_context)
-            MemoryContextDelete(state->temp_context);
-        delete state;
+        /* Call cleanup() to release resources early.
+         * The destructor will also be called via memory context callback
+         * when the scan context is deleted, but cleanup() is idempotent. */
+        state->cleanup();
         node->fdw_state = nullptr;
     }
 }
@@ -404,6 +447,7 @@ levelPivotBeginForeignModify(ModifyTableState *mtstate,
         return;
 
     PG_TRY_CPP({
+        EState *estate = mtstate->ps.state;
         Relation rel = rinfo->ri_RelationDesc;
         ForeignTable *table = GetForeignTable(RelationGetRelid(rel));
         ForeignServer *server = GetForeignServer(table->serverid);
@@ -414,8 +458,13 @@ levelPivotBeginForeignModify(ModifyTableState *mtstate,
 
         std::string key_pattern = get_table_option(table, "key_pattern");
 
-        /* Create modify state */
-        auto state = new LevelPivotModifyState();
+        /* Create dedicated memory context for modify state */
+        MemoryContext modify_ctx = AllocSetContextCreate(estate->es_query_cxt,
+                                                         "level_pivot modify",
+                                                         ALLOCSET_DEFAULT_SIZES);
+
+        /* Create modify state using pg_construct for automatic cleanup */
+        auto state = level_pivot::pg_construct<LevelPivotModifyState>(modify_ctx);
 
         /* Build projection */
         state->projection = build_projection_from_relation(rel, key_pattern);
@@ -479,10 +528,9 @@ levelPivotExecForeignUpdate(EState *estate,
 
         HeapTupleHeader oldtup = DatumGetHeapTupleHeader(datum);
 
-        /* Extract old values */
-        TupleDesc tupdesc = RelationGetDescr(rinfo->ri_RelationDesc);
-        Datum *old_values = (Datum *) palloc(state->num_cols * sizeof(Datum));
-        bool *old_nulls = (bool *) palloc(state->num_cols * sizeof(bool));
+        /* Extract old values using stack-based TempArray */
+        DatumTempArray old_values(state->num_cols);
+        BoolTempArray old_nulls(state->num_cols);
 
         for (int i = 0; i < state->num_cols; i++)
         {
@@ -492,11 +540,8 @@ levelPivotExecForeignUpdate(EState *estate,
         /* Get new values from slot */
         slot_getallattrs(slot);
 
-        state->writer->update(old_values, old_nulls,
+        state->writer->update(old_values.data(), old_nulls.data(),
                              slot->tts_values, slot->tts_isnull);
-
-        pfree(old_values);
-        pfree(old_nulls);
 
         return slot;
     }, slot);
@@ -526,19 +571,16 @@ levelPivotExecForeignDelete(EState *estate,
 
         HeapTupleHeader oldtup = DatumGetHeapTupleHeader(datum);
 
-        /* Extract values */
-        Datum *values = (Datum *) palloc(state->num_cols * sizeof(Datum));
-        bool *nulls = (bool *) palloc(state->num_cols * sizeof(bool));
+        /* Extract values using stack-based TempArray */
+        DatumTempArray values(state->num_cols);
+        BoolTempArray nulls(state->num_cols);
 
         for (int i = 0; i < state->num_cols; i++)
         {
             values[i] = GetAttributeByNum(oldtup, i + 1, &nulls[i]);
         }
 
-        state->writer->remove(values, nulls);
-
-        pfree(values);
-        pfree(nulls);
+        state->writer->remove(values.data(), nulls.data());
 
         return slot;
     }, slot);
@@ -555,7 +597,10 @@ levelPivotEndForeignModify(EState *estate, ResultRelInfo *rinfo)
 
     if (state)
     {
-        delete state;
+        /* Call cleanup() to release resources early.
+         * The destructor will also be called via memory context callback
+         * when the modify context is deleted, but cleanup() is idempotent. */
+        state->cleanup();
         rinfo->ri_FdwState = nullptr;
     }
 }
