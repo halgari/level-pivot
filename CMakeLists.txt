@@ -137,6 +137,9 @@ if(BUILD_TESTING)
     else()
         message(STATUS "GTest not found, skipping unit tests")
     endif()
+
+    # Integration tests (uses embedded PostgreSQL)
+    add_subdirectory(test/integration)
 endif()
 
 # Benchmarks
