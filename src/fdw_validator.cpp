@@ -2,12 +2,7 @@
  * FDW option validation
  */
 
-// Windows compatibility: include winsock before PostgreSQL headers
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#endif
-
+// PostgreSQL headers must come first for Windows compatibility
 extern "C" {
 #include "postgres.h"
 #include "fmgr.h"
