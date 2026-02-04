@@ -55,6 +55,12 @@ target_link_libraries(level_pivot_core PUBLIC
     ${LEVELDB_TARGET}
 )
 
+# Optimize core library for performance
+target_compile_options(level_pivot_core PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O3>
+    $<$<CXX_COMPILER_ID:MSVC>:/O2>
+)
+
 # FDW shared library
 add_library(level_pivot MODULE
     src/level_pivot_fdw.cpp
@@ -85,6 +91,14 @@ else()
         PREFIX ""
         SUFFIX ".so"
     )
+endif()
+
+# Enable Link-Time Optimization for release builds
+include(CheckIPOSupported)
+check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error)
+if(ipo_supported)
+    set_property(TARGET level_pivot_core PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    set_property(TARGET level_pivot PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
 
 # Installation
