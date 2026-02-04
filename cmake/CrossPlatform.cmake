@@ -13,6 +13,8 @@ endif()
 
 # Platform detection
 if(WIN32)
+    # WIN32 macro needed for PostgreSQL headers (MSVC only defines _WIN32)
+    add_definitions(-DWIN32)
     add_definitions(-DWIN32_LEAN_AND_MEAN)
     add_definitions(-DNOMINMAX)
 elseif(APPLE)
