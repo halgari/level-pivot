@@ -64,9 +64,9 @@ std::optional<PivotRow> PivotScanner::next_row() {
             current_attrs_.clear();
 
             // Accumulate this key into the new row
-            std::string attr_name(parsed->attr_name);
+            std::string_view attr_name = parsed->attr_name;
             if (projection_.has_attr(attr_name)) {
-                current_attrs_[attr_name] = std::string(iterator_->value_view());
+                current_attrs_[std::string(attr_name)] = std::string(iterator_->value_view());
             }
 
             iterator_->next();
@@ -74,9 +74,9 @@ std::optional<PivotRow> PivotScanner::next_row() {
         }
 
         // Accumulate this key into the current row
-        std::string attr_name(parsed->attr_name);
+        std::string_view attr_name = parsed->attr_name;
         if (projection_.has_attr(attr_name)) {
-            current_attrs_[attr_name] = std::string(iterator_->value_view());
+            current_attrs_[std::string(attr_name)] = std::string(iterator_->value_view());
         }
 
         iterator_->next();

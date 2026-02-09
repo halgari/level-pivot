@@ -77,6 +77,9 @@ All three keys become one row with columns: `group_name`, `id`, `name`, `email`,
 - **Connection pooling**: Connections are cached per PostgreSQL server
 - **Flexible patterns**: Supports multiple delimiter styles (`##`, `__`, `/`, `:`)
 - **Type conversion**: Maps LevelDB string values to PostgreSQL types (TEXT, INTEGER, BOOLEAN, JSONB, etc.)
+- **Raw table mode**: Direct key-value access without pattern parsing
+- **Change notifications**: Automatic NOTIFY on table modifications
+- **Schema discovery**: Import foreign schema from existing LevelDB data
 - **Cross-platform**: Builds on Linux, macOS, and Windows
 
 ## Installation
@@ -181,6 +184,55 @@ UPDATE users SET email = NULL WHERE id = 'user003';
 DELETE FROM users WHERE group_name = 'admins' AND id = 'user003';
 ```
 
+### Raw Table Mode
+
+For direct key-value access without pattern parsing:
+
+```sql
+CREATE FOREIGN TABLE raw_kv (
+    key   TEXT,
+    value TEXT
+)
+SERVER my_leveldb
+OPTIONS (table_mode 'raw');
+
+-- Insert key-value pairs
+INSERT INTO raw_kv VALUES ('mykey', 'myvalue');
+
+-- Supports range queries
+SELECT * FROM raw_kv WHERE key >= 'prefix:' AND key < 'prefix:\xFF';
+
+-- Point lookups
+SELECT value FROM raw_kv WHERE key = 'mykey';
+```
+
+### Change Notifications
+
+Tables automatically send PostgreSQL NOTIFY on modifications:
+
+```sql
+-- Listen for changes
+LISTEN public_users_changed;
+
+-- Any INSERT/UPDATE/DELETE triggers notification
+INSERT INTO users VALUES ('group1', 'id1', 'Alice');
+-- Notification received: public_users_changed
+```
+
+Channel format: `{schema}_{table}_changed` (truncated to 63 chars)
+
+### Schema Discovery
+
+Automatically discover table structure from existing LevelDB data:
+
+```sql
+IMPORT FOREIGN SCHEMA leveldb_schema
+FROM SERVER my_leveldb
+INTO public;
+```
+
+This analyzes existing keys, infers a pattern, discovers attribute names, and generates the CREATE FOREIGN TABLE statement.
+
 ## Configuration
 
 ### Server Options
@@ -190,14 +242,17 @@ DELETE FROM users WHERE group_name = 'admins' AND id = 'user003';
 | `db_path` | (required) | Path to the LevelDB database directory |
 | `read_only` | `true` | Open database in read-only mode |
 | `create_if_missing` | `false` | Create database if it doesn't exist |
-| `block_cache_size` | `8388608` | LRU block cache size in bytes (8MB) |
-| `write_buffer_size` | `4194304` | Write buffer size in bytes (4MB) |
+| `block_cache_size` | `8388608` | LRU block cache size in bytes (8MB, supports K/M/G suffixes) |
+| `write_buffer_size` | `4194304` | Write buffer size in bytes (4MB, supports K/M/G suffixes) |
+| `use_write_batch` | `true` | Use atomic WriteBatch for modifications |
 
 ### Table Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `key_pattern` | (required) | Key pattern with `{name}` placeholders |
+| `key_pattern` | (required for pivot) | Key pattern with `{name}` placeholders |
+| `table_mode` | `pivot` | Table mode: `pivot` (pattern-based) or `raw` (direct key-value) |
+| `prefix_filter` | (none) | Optional prefix to filter keys (raw mode) |
 
 ## Key Pattern Syntax
 
@@ -300,6 +355,15 @@ psql -f test/integration/test_modify.sql
 # Cleanup
 psql -f test/integration/cleanup.sql
 ```
+
+## Performance Features
+
+- **SIMD Optimization**: AVX2/SSE2 accelerated delimiter detection with automatic scalar fallback
+- **Zero-Copy Parsing**: Uses `string_view` to avoid allocations during key parsing
+- **Filter Pushdown**: WHERE clauses on identity columns use LevelDB prefix scans
+- **Link-Time Optimization**: Release builds use LTO for cross-module optimization
+- **Connection Pooling**: LevelDB connections cached per PostgreSQL server
+- **Atomic Batch Writes**: Multiple modifications batched into single atomic write
 
 ## Performance Considerations
 

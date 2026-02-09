@@ -196,7 +196,7 @@ std::string TypeConverter::datum_to_string(Datum datum, PgType type, bool is_nul
 
             std::string result;
             result.reserve(2 + len * 2);
-            result = "\\x";
+            result.append("\\x");
             for (size_t i = 0; i < len; ++i) {
                 result += hex_chars[bytes[i] >> 4];
                 result += hex_chars[bytes[i] & 0x0f];

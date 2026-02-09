@@ -77,80 +77,97 @@ TableMode get_table_mode(ForeignTable *table)
     return TableMode::PIVOT;  /* Default */
 }
 
+/* Base struct for common FDW state fields */
+struct FdwStateBase {
+    std::shared_ptr<level_pivot::LevelDBConnection> connection;
+    bool cleaned_up;
+
+    FdwStateBase() : cleaned_up(false) {}
+    virtual ~FdwStateBase() = default;
+
+protected:
+    bool begin_cleanup() {
+        if (cleaned_up)
+            return false;
+        cleaned_up = true;
+        return true;
+    }
+
+    void cleanup_connection() {
+        connection.reset();
+    }
+};
+
+/* Base struct for scan state (adds temp_context) */
+struct ScanStateBase : FdwStateBase {
+    MemoryContext temp_context;
+
+    ScanStateBase() : temp_context(nullptr) {}
+};
+
+/* Base struct for modify state (adds NOTIFY support) */
+struct ModifyStateBase : FdwStateBase {
+    std::string schema_name;
+    std::string table_name;
+    bool has_modifications;
+    bool use_write_batch;
+
+    ModifyStateBase() : has_modifications(false), use_write_batch(true) {}
+};
+
 /* Scan state structure */
-struct LevelPivotScanState {
+struct LevelPivotScanState : ScanStateBase {
     std::unique_ptr<level_pivot::Projection> projection;
     std::unique_ptr<level_pivot::PivotScanner> scanner;
-    std::shared_ptr<level_pivot::LevelDBConnection> connection;
-    MemoryContext temp_context;
-    bool cleaned_up;
     std::vector<std::string> prefix_values;  // Pushdown filter values
-
-    LevelPivotScanState() : temp_context(nullptr), cleaned_up(false) {}
 
     ~LevelPivotScanState() { cleanup(); }
 
     void cleanup() {
-        if (cleaned_up)
+        if (!begin_cleanup())
             return;
-        cleaned_up = true;
 
         if (scanner)
             scanner->end_scan();
         scanner.reset();
         projection.reset();
-        connection.reset();
+        cleanup_connection();
         // Note: temp_context is a child of scan_ctx, will be deleted with parent
     }
 };
 
 /* Raw scan state structure for raw table mode */
-struct RawScanState {
+struct RawScanState : ScanStateBase {
     std::unique_ptr<level_pivot::RawScanner> scanner;
-    std::shared_ptr<level_pivot::LevelDBConnection> connection;
     level_pivot::RawScanBounds bounds;
-    MemoryContext temp_context;
-    bool cleaned_up;
-
-    RawScanState() : temp_context(nullptr), cleaned_up(false) {}
 
     ~RawScanState() { cleanup(); }
 
     void cleanup() {
-        if (cleaned_up)
+        if (!begin_cleanup())
             return;
-        cleaned_up = true;
 
         if (scanner)
             scanner->end_scan();
         scanner.reset();
-        connection.reset();
+        cleanup_connection();
     }
 };
 
 /* Modify state structure */
-struct LevelPivotModifyState {
+struct LevelPivotModifyState : ModifyStateBase {
     std::unique_ptr<level_pivot::Projection> projection;
     std::unique_ptr<level_pivot::Writer> writer;
-    std::shared_ptr<level_pivot::LevelDBConnection> connection;
     int num_cols;
     AttrNumber *attr_map;  // Maps foreign column attnums to local slot positions
-    bool use_write_batch;
-    bool cleaned_up;
 
-    // NOTIFY support
-    std::string schema_name;
-    std::string table_name;
-    bool has_modifications;
-
-    LevelPivotModifyState() : num_cols(0), attr_map(nullptr), use_write_batch(true), cleaned_up(false), has_modifications(false) {}
+    LevelPivotModifyState() : num_cols(0), attr_map(nullptr) {}
 
     ~LevelPivotModifyState() { cleanup(); }
 
     void cleanup() {
-        if (cleaned_up)
+        if (!begin_cleanup())
             return;
-        cleaned_up = true;
 
         // Discard any uncommitted batch operations
         if (writer && writer->is_batched()) {
@@ -158,38 +175,29 @@ struct LevelPivotModifyState {
         }
         writer.reset();
         projection.reset();
-        connection.reset();
+        cleanup_connection();
     }
 };
 
 /* Raw modify state structure for raw table mode */
-struct RawModifyState {
+struct RawModifyState : ModifyStateBase {
     std::unique_ptr<level_pivot::RawWriter> writer;
-    std::shared_ptr<level_pivot::LevelDBConnection> connection;
     AttrNumber key_attnum;    // Attribute number of the 'key' column
     AttrNumber value_attnum;  // Attribute number of the 'value' column
-    bool use_write_batch;
-    bool cleaned_up;
 
-    // NOTIFY support
-    std::string schema_name;
-    std::string table_name;
-    bool has_modifications;
-
-    RawModifyState() : key_attnum(0), value_attnum(0), use_write_batch(true), cleaned_up(false), has_modifications(false) {}
+    RawModifyState() : key_attnum(0), value_attnum(0) {}
 
     ~RawModifyState() { cleanup(); }
 
     void cleanup() {
-        if (cleaned_up)
+        if (!begin_cleanup())
             return;
-        cleaned_up = true;
 
         if (writer && writer->is_batched()) {
             writer->discard_batch();
         }
         writer.reset();
-        connection.reset();
+        cleanup_connection();
     }
 };
 

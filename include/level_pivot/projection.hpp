@@ -3,6 +3,7 @@
 #include "level_pivot/key_pattern.hpp"
 #include "level_pivot/key_parser.hpp"
 #include <string>
+#include <string_view>
 #include <vector>
 #include <optional>
 #include <unordered_map>
@@ -109,8 +110,10 @@ public:
     /**
      * Check if an attr name is in this projection
      */
-    bool has_attr(const std::string& attr_name) const {
-        return attr_names_.count(attr_name) > 0;
+    bool has_attr(std::string_view attr_name) const {
+        // unordered_set::count doesn't support heterogeneous lookup in C++17,
+        // so we need to construct a temporary string for the lookup
+        return attr_names_.count(std::string(attr_name)) > 0;
     }
 
     /**
