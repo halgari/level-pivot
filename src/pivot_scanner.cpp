@@ -1,3 +1,22 @@
+/**
+ * pivot_scanner.cpp - Scans LevelDB and assembles pivoted rows
+ *
+ * The core of the "pivot" operation: multiple LevelDB keys with the same
+ * identity values are combined into a single SQL row. For example:
+ *
+ *   LevelDB keys:
+ *     users##admins##user001##name  = "Alice"
+ *     users##admins##user001##email = "alice@example.com"
+ *     users##admins##user002##name  = "Bob"
+ *
+ *   Produces SQL rows:
+ *     (group='admins', id='user001', name='Alice', email='alice@example.com')
+ *     (group='admins', id='user002', name='Bob', email=NULL)
+ *
+ * The scanner maintains state across next_row() calls, accumulating attrs
+ * until the identity changes, then emitting a complete row.
+ */
+
 #include "level_pivot/pivot_scanner.hpp"
 
 namespace level_pivot {
@@ -10,15 +29,20 @@ void PivotScanner::begin_scan() {
     begin_scan({});
 }
 
+/**
+ * Initializes the scan with optional prefix filter values.
+ * If prefix_values contains ["admins"], we seek directly to "users##admins##"
+ * instead of scanning from the start, making filtered queries O(matching keys)
+ * instead of O(all keys).
+ */
 void PivotScanner::begin_scan(const std::vector<std::string>& prefix_values) {
     stats_ = Stats{};
     current_identity_.reset();
     current_attrs_.clear();
 
-    // Build prefix for seeking
+    // Build prefix from provided filter values for efficient seeking
     prefix_ = projection_.parser().build_prefix(prefix_values);
 
-    // Create iterator and seek to prefix
     iterator_ = std::make_unique<LevelDBIterator>(connection_->iterator());
 
     if (prefix_.empty()) {
@@ -28,14 +52,27 @@ void PivotScanner::begin_scan(const std::vector<std::string>& prefix_values) {
     }
 }
 
+/**
+ * Returns the next pivoted row, or nullopt when exhausted.
+ *
+ * The state machine works as follows:
+ *   1. Read keys sequentially from LevelDB
+ *   2. Parse each key to extract identity and attr
+ *   3. If identity matches current row, accumulate attr value
+ *   4. If identity changes, emit accumulated row and start new one
+ *   5. At end of iteration, emit any remaining accumulated row
+ *
+ * This streaming approach means we never load all keys into memory -
+ * we only hold one row's worth of attrs at a time.
+ */
 std::optional<PivotRow> PivotScanner::next_row() {
     while (iterator_ && iterator_->valid()) {
-        // Zero-copy: get key as string_view
+        // Zero-copy: get key as string_view to avoid allocation
         std::string_view key_sv = iterator_->key_view();
 
-        // Check if we're still within the prefix
+        // Stop scanning when we leave the prefix range.
+        // LevelDB iteration is sorted, so all matching keys are contiguous.
         if (!is_within_prefix_view(key_sv)) {
-            // Emit any accumulated row before stopping
             if (current_identity_.has_value()) {
                 return emit_current_row();
             }
@@ -44,7 +81,8 @@ std::optional<PivotRow> PivotScanner::next_row() {
 
         ++stats_.keys_scanned;
 
-        // Zero-copy parse using string_view
+        // Parse the key to extract identity values and attr name.
+        // Keys that don't match the pattern are skipped (e.g., other tables' data).
         auto parsed = projection_.parser().parse_view(key_sv);
         if (!parsed) {
             ++stats_.keys_skipped;
@@ -52,18 +90,18 @@ std::optional<PivotRow> PivotScanner::next_row() {
             continue;
         }
 
-        // Check if this is the same row or a new one
         if (!current_identity_.has_value()) {
-            // First row - materialize identity strings
+            // First key - start accumulating a new row
             current_identity_ = materialize_identity(parsed->capture_values);
             current_attrs_.clear();
         } else if (!identity_matches(*current_identity_, parsed->capture_values)) {
-            // Identity changed - emit the previous row and start a new one
+            // Identity changed - emit the completed row and start a new one.
+            // We return immediately here to yield the row to the caller.
             auto row = emit_current_row();
             current_identity_ = materialize_identity(parsed->capture_values);
             current_attrs_.clear();
 
-            // Accumulate this key into the new row
+            // Don't lose this key's attr - add it to the new row
             std::string_view attr_name = parsed->attr_name;
             if (projection_.has_attr(attr_name)) {
                 current_attrs_[std::string(attr_name)] = std::string(iterator_->value_view());
@@ -73,7 +111,8 @@ std::optional<PivotRow> PivotScanner::next_row() {
             return row;
         }
 
-        // Accumulate this key into the current row
+        // Same identity - accumulate this attr into the current row.
+        // Only accumulate attrs that are in our projection (table columns).
         std::string_view attr_name = parsed->attr_name;
         if (projection_.has_attr(attr_name)) {
             current_attrs_[std::string(attr_name)] = std::string(iterator_->value_view());
@@ -82,7 +121,7 @@ std::optional<PivotRow> PivotScanner::next_row() {
         iterator_->next();
     }
 
-    // End of iteration - emit any remaining row
+    // End of iteration - emit any remaining accumulated row
     if (current_identity_.has_value()) {
         return emit_current_row();
     }
@@ -117,6 +156,11 @@ bool PivotScanner::is_within_prefix_view(std::string_view key) const {
     return key.substr(0, prefix_.size()) == prefix_;
 }
 
+/**
+ * Converts string_views (pointing into LevelDB's memory) into owned strings.
+ * We must do this before calling iterator_->next() because LevelDB may
+ * invalidate the previous key's memory.
+ */
 std::vector<std::string> PivotScanner::materialize_identity(
     const std::vector<std::string_view>& views) {
     std::vector<std::string> result;
@@ -127,6 +171,10 @@ std::vector<std::string> PivotScanner::materialize_identity(
     return result;
 }
 
+/**
+ * Compares owned identity strings with parsed string_views without allocation.
+ * This is called for every key to detect row boundaries.
+ */
 bool PivotScanner::identity_matches(
     const std::vector<std::string>& identity,
     const std::vector<std::string_view>& views) {
@@ -141,6 +189,10 @@ bool PivotScanner::identity_matches(
     return true;
 }
 
+/**
+ * Packages accumulated identity and attrs into a PivotRow and resets state.
+ * Uses std::move to transfer ownership efficiently.
+ */
 std::optional<PivotRow> PivotScanner::emit_current_row() {
     if (!current_identity_.has_value()) {
         return std::nullopt;
@@ -158,8 +210,15 @@ std::optional<PivotRow> PivotScanner::emit_current_row() {
     return row;
 }
 
-// DatumBuilder implementation
-
+/**
+ * DatumBuilder converts PivotRows into PostgreSQL Datum arrays for tuple building.
+ *
+ * The challenge is mapping between two orderings:
+ *   - PivotRow::identity_values are ordered by pattern capture order
+ *   - PostgreSQL tuple expects values in column attnum order
+ *
+ * We use pre-computed column_to_identity_index for O(1) mapping.
+ */
 void DatumBuilder::build_datums(const PivotRow& row,
                                 const Projection& projection,
                                 Datum* values,
@@ -170,7 +229,8 @@ void DatumBuilder::build_datums(const PivotRow& row,
         const auto& col = columns[i];
 
         if (col.is_identity) {
-            // Identity column - use O(1) lookup via pre-computed index
+            // Identity column: look up value by pre-computed index into identity_values.
+            // This avoids name-based lookup for every cell.
             int identity_idx = projection.column_to_identity_index(i);
             if (identity_idx >= 0 &&
                 static_cast<size_t>(identity_idx) < row.identity_values.size()) {
@@ -181,7 +241,8 @@ void DatumBuilder::build_datums(const PivotRow& row,
                 values[i] = (Datum)0;
             }
         } else {
-            // Attr column - look up in attr_values
+            // Attr column: look up by column name in attr_values map.
+            // Missing attrs are NULL (that attr key didn't exist in LevelDB).
             auto it = row.attr_values.find(col.name);
             if (it != row.attr_values.end()) {
                 values[i] = TypeConverter::string_to_datum(it->second, col.type, nulls[i]);

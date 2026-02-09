@@ -1,5 +1,22 @@
 /**
- * FDW option validation
+ * fdw_validator.cpp - Validates options for CREATE SERVER and CREATE FOREIGN TABLE
+ *
+ * PostgreSQL calls levelPivotValidateOptions during DDL to verify options:
+ *
+ * Server options (CREATE SERVER ... OPTIONS):
+ *   - db_path (required): Path to LevelDB database directory
+ *   - read_only: Open database in read-only mode
+ *   - create_if_missing: Create database if it doesn't exist
+ *   - block_cache_size: LevelDB block cache size (supports K/M/G suffixes)
+ *   - write_buffer_size: LevelDB write buffer size
+ *   - use_write_batch: Enable atomic batched writes (default true)
+ *
+ * Table options (CREATE FOREIGN TABLE ... OPTIONS):
+ *   - key_pattern (required for pivot mode): Key pattern with placeholders
+ *   - prefix_filter: Optional prefix to filter keys
+ *   - table_mode: 'pivot' (default) or 'raw'
+ *
+ * Validation catches errors early with helpful error messages.
  */
 
 // PostgreSQL headers must come first for Windows compatibility
@@ -19,7 +36,7 @@ extern "C" {
 
 namespace {
 
-/* Valid SERVER options */
+/* Whitelist of valid SERVER options - rejects typos like "db-path" */
 const std::unordered_set<std::string> server_options = {
     "db_path",
     "read_only",
@@ -29,19 +46,28 @@ const std::unordered_set<std::string> server_options = {
     "use_write_batch"
 };
 
-/* Valid FOREIGN TABLE options */
+/* Whitelist of valid FOREIGN TABLE options */
 const std::unordered_set<std::string> table_options = {
     "key_pattern",
     "prefix_filter",
     "table_mode"
 };
 
+/**
+ * Validates boolean option values.
+ * Accepts PostgreSQL's standard boolean representations.
+ */
 bool is_valid_bool(const char* value) {
     std::string v(value);
     return v == "true" || v == "false" || v == "on" || v == "off" ||
            v == "1" || v == "0" || v == "yes" || v == "no";
 }
 
+/**
+ * Validates size option values (block_cache_size, write_buffer_size).
+ * Accepts plain numbers or numbers with K/M/G suffix for kilobytes/megabytes/gigabytes.
+ * Examples: "8388608", "8M", "8192K"
+ */
 bool is_valid_size(const char* value) {
     char* end;
     long long num = strtoll(value, &end, 10);
@@ -56,6 +82,15 @@ bool is_valid_size(const char* value) {
 
 extern "C" {
 
+/**
+ * Main validation entry point called by PostgreSQL.
+ *
+ * catalog determines what kind of object we're validating:
+ *   - ForeignServerRelationId: CREATE/ALTER SERVER
+ *   - ForeignTableRelationId: CREATE/ALTER FOREIGN TABLE
+ *
+ * Uses ereport(ERROR, ...) to abort with descriptive error messages.
+ */
 void levelPivotValidateOptions(List *options_list, Oid catalog)
 {
     ListCell *cell;
@@ -67,7 +102,7 @@ void levelPivotValidateOptions(List *options_list, Oid catalog)
 
         if (catalog == ForeignServerRelationId)
         {
-            /* Validate SERVER options */
+            /* Check option name is in whitelist */
             if (server_options.find(name) == server_options.end())
             {
                 ereport(ERROR,
@@ -128,7 +163,9 @@ void levelPivotValidateOptions(List *options_list, Oid catalog)
 
             if (name == "key_pattern")
             {
-                /* Validate the key pattern syntax */
+                /* Parse the pattern to catch syntax errors early.
+                 * This also validates that {attr} is present and
+                 * there are no consecutive variable segments. */
                 try {
                     level_pivot::KeyPattern pattern(value);
 
@@ -199,7 +236,9 @@ void levelPivotValidateOptions(List *options_list, Oid catalog)
             }
         }
 
-        /* Validate key_pattern based on table_mode */
+        /* Cross-validate: table_mode and key_pattern are mutually constrained.
+         * Raw mode: no key_pattern (keys are passed through as-is)
+         * Pivot mode: key_pattern required (defines how keys become columns) */
         if (is_raw_mode)
         {
             if (has_key_pattern)
@@ -212,7 +251,7 @@ void levelPivotValidateOptions(List *options_list, Oid catalog)
         }
         else
         {
-            /* Default pivot mode - key_pattern is required */
+            /* Default pivot mode - key_pattern tells us how to parse keys */
             if (!has_key_pattern)
             {
                 ereport(ERROR,

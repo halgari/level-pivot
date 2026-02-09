@@ -1,3 +1,20 @@
+/**
+ * key_parser.cpp - Runtime key parsing and building
+ *
+ * The parser takes LevelDB keys and extracts capture values and attr names
+ * according to a KeyPattern. For example, given pattern "users##{group}##{id}##{attr}"
+ * and key "users##admins##user001##email", it produces:
+ *   - capture_values: ["admins", "user001"]
+ *   - attr_name: "email"
+ *
+ * The parser also builds keys from values (for INSERT/UPDATE/DELETE operations).
+ *
+ * Performance optimizations:
+ *   - SIMD-accelerated parsing for uniform delimiter patterns (AVX2/SSE2)
+ *   - Zero-copy parse_view() returns string_views into the original key
+ *   - Pre-computed key size estimates reduce allocations
+ */
+
 #include "level_pivot/key_parser.hpp"
 #include <stdexcept>
 
@@ -13,9 +30,12 @@ KeyParser::KeyParser(const std::string& pattern) : pattern_(pattern) {
     try_init_simd_parser();
 }
 
+/**
+ * Pre-compute an estimate of typical key size to reduce reallocations when
+ * building keys. We assume ~16 bytes per capture/attr which is reasonable
+ * for typical identifiers like "user001", "production", "email", etc.
+ */
 void KeyParser::compute_estimated_key_size() {
-    // Estimate key size based on literals + average capture size
-    // Assume ~16 bytes per capture/attr as reasonable estimate
     constexpr size_t avg_capture_len = 16;
 
     estimated_key_size_ = 0;
@@ -34,8 +54,11 @@ bool KeyParser::matches(const std::string& key) const {
 
 namespace {
 
-// Unified parsing implementation that works for both ParsedKey and ParsedKeyView
-// Uses a policy-based approach to handle type differences
+/**
+ * Template-based parsing implementation shared between ParsedKey (owning strings)
+ * and ParsedKeyView (non-owning string_views). This avoids code duplication while
+ * allowing the hot path (parse_view) to avoid all allocations.
+ */
 template<typename ResultType>
 struct ParsePolicy;
 
@@ -61,6 +84,14 @@ struct ParsePolicy<ParsedKeyView> {
     }
 };
 
+/**
+ * Core parsing algorithm: walk through pattern segments, matching literals
+ * exactly and extracting variable segments up to the next delimiter.
+ *
+ * The algorithm relies on KeyPattern's validation that ensures no consecutive
+ * variable segments - this guarantees we always know where each variable ends
+ * (either at the next literal or end of string).
+ */
 template<typename ResultType>
 std::optional<ResultType> parse_impl(const KeyPattern& pattern, std::string_view key) {
     const auto& segments = pattern.segments();
@@ -73,6 +104,7 @@ std::optional<ResultType> parse_impl(const KeyPattern& pattern, std::string_view
         const auto& segment = segments[seg_idx];
 
         if (std::holds_alternative<LiteralSegment>(segment)) {
+            // Literals must match exactly - this is how we find delimiters
             const auto& literal = std::get<LiteralSegment>(segment);
 
             if (key.compare(key_pos, literal.text.size(), literal.text) != 0) {
@@ -81,6 +113,9 @@ std::optional<ResultType> parse_impl(const KeyPattern& pattern, std::string_view
             key_pos += literal.text.size();
 
         } else if (std::holds_alternative<CaptureSegment>(segment)) {
+            // Find where this capture ends by looking for the next delimiter.
+            // Because KeyPattern disallows consecutive variables, the next
+            // segment is guaranteed to be a literal (or end of pattern).
             size_t end_pos;
 
             if (seg_idx + 1 < segments.size()) {
@@ -93,6 +128,7 @@ std::optional<ResultType> parse_impl(const KeyPattern& pattern, std::string_view
                 end_pos = key.size();
             }
 
+            // Empty captures are invalid - they'd create ambiguous keys
             if (end_pos == key_pos) {
                 return std::nullopt;
             }
@@ -101,6 +137,7 @@ std::optional<ResultType> parse_impl(const KeyPattern& pattern, std::string_view
             key_pos = end_pos;
 
         } else if (std::holds_alternative<AttrSegment>(segment)) {
+            // Attr extraction works the same as captures
             size_t end_pos;
 
             if (seg_idx + 1 < segments.size()) {
@@ -122,6 +159,7 @@ std::optional<ResultType> parse_impl(const KeyPattern& pattern, std::string_view
         }
     }
 
+    // Ensure we consumed the entire key - leftover chars mean pattern mismatch
     if (key_pos != key.size()) {
         return std::nullopt;
     }
@@ -135,8 +173,14 @@ std::optional<ParsedKey> KeyParser::parse(const std::string& key) const {
     return parse_impl<ParsedKey>(pattern_, key);
 }
 
+/**
+ * Zero-copy parsing returns string_views into the original key.
+ * Uses SIMD-accelerated parsing when the pattern has uniform delimiters,
+ * falling back to the generic implementation otherwise.
+ */
 std::optional<ParsedKeyView> KeyParser::parse_view(std::string_view key) const {
-    // Use SIMD parser if available (uniform delimiter pattern)
+    // SIMD path: uses vectorized delimiter detection for patterns like
+    // "prefix##{a}##{b}##{attr}" where all delimiters are "##"
     if (simd_parser_) {
         std::string_view captures[16];  // Stack-allocated, max 16 captures
         std::string_view attr;
@@ -154,6 +198,11 @@ std::optional<ParsedKeyView> KeyParser::parse_view(std::string_view key) const {
     return parse_impl<ParsedKeyView>(pattern_, key);
 }
 
+/**
+ * Builds a LevelDB key from capture values and attr name.
+ * This is the inverse of parse() - used for INSERT, UPDATE, DELETE operations
+ * that need to construct keys to write to LevelDB.
+ */
 std::string KeyParser::build(const std::vector<std::string>& capture_values,
                              const std::string& attr_name) const {
     if (capture_values.size() != pattern_.capture_count()) {
@@ -170,6 +219,7 @@ std::string KeyParser::build(const std::vector<std::string>& capture_values,
     result.reserve(estimated_key_size_);
     size_t capture_idx = 0;
 
+    // Reassemble the key by walking segments and substituting values
     for (const auto& segment : pattern_.segments()) {
         if (std::holds_alternative<LiteralSegment>(segment)) {
             result += std::get<LiteralSegment>(segment).text;
@@ -190,11 +240,16 @@ std::string KeyParser::build(const std::vector<std::string>& capture_values,
     return result;
 }
 
+/**
+ * Build variant that takes a name->value map instead of ordered vector.
+ * More convenient when values come from PostgreSQL columns.
+ */
 std::string KeyParser::build(const std::unordered_map<std::string, std::string>& captures,
                              const std::string& attr_name) const {
     std::vector<std::string> capture_values;
     capture_values.reserve(pattern_.capture_count());
 
+    // Convert map to ordered vector matching pattern's capture order
     for (const auto& name : pattern_.capture_names()) {
         auto it = captures.find(name);
         if (it == captures.end()) {
@@ -210,6 +265,12 @@ std::string KeyParser::build_prefix() const {
     return pattern_.literal_prefix();
 }
 
+/**
+ * Builds a prefix for LevelDB seeks using partial capture values.
+ * For pattern "users##{group}##{id}##{attr}" and captures ["admins"],
+ * returns "users##admins##" - enabling efficient range scans over
+ * all keys in the "admins" group.
+ */
 std::string KeyParser::build_prefix(const std::vector<std::string>& capture_values) const {
     std::string result;
     result.reserve(estimated_key_size_);
@@ -220,13 +281,14 @@ std::string KeyParser::build_prefix(const std::vector<std::string>& capture_valu
             result += std::get<LiteralSegment>(segment).text;
         } else if (std::holds_alternative<CaptureSegment>(segment)) {
             if (capture_idx >= capture_values.size()) {
-                // No more capture values provided, stop here
+                // Stop when we run out of provided capture values.
+                // This creates a prefix for range scanning.
                 break;
             }
             result += capture_values[capture_idx];
             ++capture_idx;
         } else if (std::holds_alternative<AttrSegment>(segment)) {
-            // Stop before attr segment
+            // Never include attr in prefix - we want all attrs for an identity
             break;
         }
     }
@@ -242,6 +304,15 @@ bool KeyParser::starts_with_prefix(const std::string& key) const {
     return key.compare(0, prefix.size(), prefix) == 0;
 }
 
+/**
+ * Checks if the pattern uses a single, uniform delimiter between all segments.
+ * SIMD parsing can only be used for uniform delimiters because it searches
+ * for a single delimiter pattern across the entire key.
+ *
+ * Examples:
+ *   "prefix##{a}##{b}##{attr}" -> returns "##"
+ *   "prefix##{a}__{b}##{attr}" -> returns nullopt (mixed ## and __)
+ */
 std::optional<std::string> KeyParser::try_get_uniform_delimiter() const {
     std::string delimiter;
     bool first_literal = true;
@@ -252,7 +323,7 @@ std::optional<std::string> KeyParser::try_get_uniform_delimiter() const {
         if (std::holds_alternative<LiteralSegment>(seg)) {
             const auto& lit = std::get<LiteralSegment>(seg).text;
 
-            // Skip prefix literal (first literal before any capture)
+            // Skip the prefix - it's not a delimiter between captures
             if (first_literal && i == 0) {
                 first_literal = false;
                 continue;
@@ -264,9 +335,7 @@ std::optional<std::string> KeyParser::try_get_uniform_delimiter() const {
                 return std::nullopt;  // Non-uniform delimiters
             }
         } else {
-            // We hit a capture or attr segment
             if (first_literal) {
-                // Pattern starts with capture, no prefix
                 first_literal = false;
             }
         }
@@ -275,18 +344,21 @@ std::optional<std::string> KeyParser::try_get_uniform_delimiter() const {
     return delimiter.empty() ? std::nullopt : std::optional(delimiter);
 }
 
+/**
+ * Initialize SIMD parser if the pattern supports it.
+ * SIMD parsing provides ~3-5x speedup for key parsing by using vectorized
+ * delimiter detection instead of byte-by-byte scanning.
+ */
 void KeyParser::try_init_simd_parser() {
-    // Check if pattern has uniform delimiters
     auto uniform_delim = try_get_uniform_delimiter();
     if (!uniform_delim) {
         return;  // Non-uniform delimiters, can't use SIMD
     }
 
-    // Store owned copies of strings for SIMD parser
+    // Store owned copies - SIMD parser needs stable string_views
     simd_prefix_ = pattern_.literal_prefix();
     simd_delimiter_ = *uniform_delim;
 
-    // Create SIMD parser with stable string_views to our owned strings
     simd_parser_ = std::make_unique<SimdKeyParser>(
         simd_prefix_,
         simd_delimiter_,

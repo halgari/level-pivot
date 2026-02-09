@@ -184,6 +184,144 @@ UPDATE users SET email = NULL WHERE id = 'user003';
 DELETE FROM users WHERE group_name = 'admins' AND id = 'user003';
 ```
 
+## SQL Examples with Output
+
+This section shows complete input/output examples for common operations.
+
+### Setup Example
+
+```sql
+-- Create server and table
+CREATE SERVER demo_leveldb
+    FOREIGN DATA WRAPPER level_pivot
+    OPTIONS (db_path '/tmp/demo.leveldb', create_if_missing 'true');
+
+CREATE FOREIGN TABLE products (
+    category TEXT,      -- identity: {category}
+    product_id TEXT,    -- identity: {product_id}
+    name TEXT,          -- attr
+    price TEXT,         -- attr
+    stock TEXT          -- attr
+)
+SERVER demo_leveldb
+OPTIONS (key_pattern 'products##{category}##{product_id}##{attr}');
+```
+
+### INSERT Examples
+
+```sql
+-- Insert a product (creates 3 LevelDB keys)
+INSERT INTO products (category, product_id, name, price, stock)
+VALUES ('electronics', 'prod001', 'Laptop', '999.99', '50');
+
+-- Query result:
+SELECT * FROM products;
+--  category    | product_id |  name  | price  | stock
+-- -------------+------------+--------+--------+-------
+--  electronics | prod001    | Laptop | 999.99 | 50
+
+-- Insert with NULL attr (only creates 2 keys)
+INSERT INTO products (category, product_id, name, price)
+VALUES ('electronics', 'prod002', 'Mouse', '29.99');
+
+SELECT * FROM products WHERE product_id = 'prod002';
+--  category    | product_id | name  | price | stock
+-- -------------+------------+-------+-------+-------
+--  electronics | prod002    | Mouse | 29.99 | NULL
+```
+
+### SELECT with Filter Pushdown
+
+```sql
+-- Filter on first identity column (uses prefix scan)
+EXPLAIN (COSTS OFF) SELECT * FROM products WHERE category = 'electronics';
+--                QUERY PLAN
+-- -----------------------------------------
+--  Foreign Scan on products
+--    LevelDB Prefix Filter: category='electronics'
+
+-- Filter on both identity columns (more selective prefix)
+SELECT name, price FROM products
+WHERE category = 'electronics' AND product_id = 'prod001';
+--  name   | price
+-- --------+--------
+--  Laptop | 999.99
+```
+
+### UPDATE Examples
+
+```sql
+-- Update an attr value
+UPDATE products SET price = '899.99' WHERE product_id = 'prod001';
+
+SELECT name, price FROM products WHERE product_id = 'prod001';
+--  name   | price
+-- --------+--------
+--  Laptop | 899.99
+
+-- Set attr to NULL (deletes that LevelDB key)
+UPDATE products SET stock = NULL WHERE product_id = 'prod001';
+
+SELECT name, stock FROM products WHERE product_id = 'prod001';
+--  name   | stock
+-- --------+-------
+--  Laptop | NULL
+```
+
+### DELETE Examples
+
+```sql
+-- Delete removes all attr keys for the identity
+DELETE FROM products WHERE category = 'electronics' AND product_id = 'prod002';
+
+SELECT COUNT(*) FROM products WHERE product_id = 'prod002';
+--  count
+-- -------
+--      0
+```
+
+### Raw Mode Examples
+
+```sql
+CREATE FOREIGN TABLE kv_store (
+    key TEXT,
+    value TEXT
+)
+SERVER demo_leveldb
+OPTIONS (table_mode 'raw');
+
+-- Direct key-value operations
+INSERT INTO kv_store VALUES ('user:1001:email', 'alice@example.com');
+INSERT INTO kv_store VALUES ('user:1001:name', 'Alice');
+INSERT INTO kv_store VALUES ('user:1002:email', 'bob@example.com');
+
+-- Point lookup
+SELECT value FROM kv_store WHERE key = 'user:1001:email';
+--       value
+-- ------------------
+--  alice@example.com
+
+-- Range scan (lexicographic order)
+SELECT * FROM kv_store WHERE key >= 'user:1001' AND key < 'user:1002';
+--       key        |       value
+-- -----------------+------------------
+--  user:1001:email | alice@example.com
+--  user:1001:name  | Alice
+```
+
+### NOTIFY Example
+
+```sql
+-- Session 1: Listen for changes
+LISTEN public_products_changed;
+
+-- Session 2: Modify the table
+INSERT INTO products VALUES ('books', 'book001', 'SQL Guide', '49.99', '100');
+
+-- Session 1 receives:
+-- Asynchronous notification "public_products_changed" received from server process with PID 12345.
+```
+
 ### Raw Table Mode
 
 For direct key-value access without pattern parsing:

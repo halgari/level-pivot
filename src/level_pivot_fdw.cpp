@@ -1,9 +1,19 @@
 /**
- * level_pivot - PostgreSQL Foreign Data Wrapper for LevelDB
+ * level_pivot_fdw.cpp - PostgreSQL Foreign Data Wrapper entry point
  *
- * Exposes LevelDB key-value data as relational tables with pivot semantics.
- * Transforms hierarchical keys into rows where key segments become identity
- * columns and the final segment (attr) pivots into columns.
+ * This is the main entry point for the level_pivot extension. It:
+ *   1. Registers the extension with PG_MODULE_MAGIC
+ *   2. Exports handler and validator functions via PG_FUNCTION_INFO_V1
+ *   3. Wires up the FdwRoutine with all callback implementations
+ *
+ * The FdwRoutine structure tells PostgreSQL which functions to call for:
+ *   - Planning: GetForeignRelSize, GetForeignPaths, GetForeignPlan
+ *   - Scanning: BeginForeignScan, IterateForeignScan, EndForeignScan
+ *   - Modifying: BeginForeignModify, ExecForeignInsert/Update/Delete
+ *   - Schema import: ImportForeignSchema
+ *
+ * Actual implementations are in fdw_handler.cpp to keep this file focused
+ * on the PostgreSQL integration plumbing.
  */
 
 // PostgreSQL headers must come first for Windows compatibility
@@ -88,28 +98,34 @@ extern void levelPivotValidateOptions(List *options_list, Oid catalog);
 } /* extern "C" */
 
 /**
- * FDW handler function
+ * FDW handler function - called by PostgreSQL to get our callback table.
  *
- * Returns the FdwRoutine structure containing pointers to all FDW callbacks.
+ * This is invoked when a query touches a level_pivot foreign table.
+ * PostgreSQL uses the returned FdwRoutine to dispatch operations.
+ *
+ * The routine is allocated in the current memory context and returned
+ * as a Datum (PostgreSQL's universal value type).
  */
 Datum
 level_pivot_fdw_handler(PG_FUNCTION_ARGS)
 {
     FdwRoutine *fdwroutine = makeNode(FdwRoutine);
 
-    /* Scan callbacks (required) */
+    /* Planning phase: estimate costs and build access paths */
     fdwroutine->GetForeignRelSize = levelPivotGetForeignRelSize;
     fdwroutine->GetForeignPaths = levelPivotGetForeignPaths;
     fdwroutine->GetForeignPlan = levelPivotGetForeignPlan;
+
+    /* Scan execution: iterate through rows from LevelDB */
     fdwroutine->BeginForeignScan = levelPivotBeginForeignScan;
     fdwroutine->IterateForeignScan = levelPivotIterateForeignScan;
     fdwroutine->ReScanForeignScan = levelPivotReScanForeignScan;
     fdwroutine->EndForeignScan = levelPivotEndForeignScan;
 
-    /* Explain callback */
+    /* EXPLAIN output enhancement */
     fdwroutine->ExplainForeignScan = levelPivotExplainForeignScan;
 
-    /* Modify callbacks */
+    /* DML operations: INSERT, UPDATE, DELETE */
     fdwroutine->AddForeignUpdateTargets = levelPivotAddForeignUpdateTargets;
     fdwroutine->PlanForeignModify = levelPivotPlanForeignModify;
     fdwroutine->BeginForeignModify = levelPivotBeginForeignModify;
@@ -119,16 +135,20 @@ level_pivot_fdw_handler(PG_FUNCTION_ARGS)
     fdwroutine->EndForeignModify = levelPivotEndForeignModify;
     fdwroutine->IsForeignRelUpdatable = levelPivotIsForeignRelUpdatable;
 
-    /* Schema import callback */
+    /* IMPORT FOREIGN SCHEMA support for auto-discovery */
     fdwroutine->ImportForeignSchema = levelPivotImportForeignSchema;
 
     PG_RETURN_POINTER(fdwroutine);
 }
 
 /**
- * FDW validator function
+ * FDW validator function - called during CREATE/ALTER SERVER/TABLE.
  *
- * Validates options for SERVER and FOREIGN TABLE.
+ * PostgreSQL passes options as a packed Datum that we unpack into a List.
+ * The catalog OID tells us whether we're validating server or table options.
+ *
+ * Validation happens before the DDL is committed, so invalid options
+ * cause the statement to fail with a helpful error message.
  */
 Datum
 level_pivot_fdw_validator(PG_FUNCTION_ARGS)

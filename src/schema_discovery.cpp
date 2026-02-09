@@ -1,3 +1,18 @@
+/**
+ * schema_discovery.cpp - Automatic table structure inference from LevelDB data
+ *
+ * When you have an existing LevelDB database, SchemaDiscovery can analyze
+ * the keys to automatically generate CREATE FOREIGN TABLE statements.
+ *
+ * Features:
+ *   - discover(): Scans keys matching a pattern to find attr names
+ *   - list_prefixes(): Finds common key prefixes (potential table names)
+ *   - infer_pattern(): Guesses the key pattern from data samples
+ *   - generate_foreign_table_sql(): Creates DDL from discovery results
+ *
+ * Used by: IMPORT FOREIGN SCHEMA command in PostgreSQL
+ */
+
 #include "level_pivot/schema_discovery.hpp"
 #include <algorithm>
 #include <cstring>
@@ -10,6 +25,17 @@ namespace level_pivot {
 SchemaDiscovery::SchemaDiscovery(std::shared_ptr<LevelDBConnection> connection)
     : connection_(std::move(connection)) {}
 
+/**
+ * Scans LevelDB keys matching a pattern to discover attr column names.
+ *
+ * For pattern "users##{id}##{attr}", this finds all unique {attr} values
+ * in the database (e.g., "name", "email", "age") which become columns.
+ *
+ * Options control scanning behavior:
+ *   - prefix_filter: only scan keys starting with this prefix
+ *   - max_keys: stop after scanning this many keys (default 10000)
+ *   - sample_size: store this many sample values per attr
+ */
 DiscoveryResult SchemaDiscovery::discover(const KeyPattern& pattern,
                                           const DiscoveryOptions& options) {
     DiscoveryResult result;
@@ -78,12 +104,22 @@ DiscoveryResult SchemaDiscovery::discover(const KeyPattern& pattern,
     return result;
 }
 
+/**
+ * Lists unique key prefixes at a given depth, useful for discovering
+ * what "tables" exist in the database.
+ *
+ * For keys like "users##1##name", "users##1##email", "orders##123##total",
+ * list_prefixes(1) returns ["orders##", "users##"].
+ *
+ * Uses seek optimization: after finding a prefix, jumps past all keys
+ * with that prefix to find the next distinct one.
+ */
 std::vector<std::string> SchemaDiscovery::list_prefixes(size_t depth,
                                                          size_t max_prefixes) {
     std::unordered_set<std::string> prefixes;
     std::vector<std::string> result;
 
-    // Common delimiter patterns
+    // Regex matches common key delimiters used in practice
     std::regex delim_regex("(##|::|//|__|:|/|\\.|-)");
 
     auto iter = connection_->iterator();
@@ -133,6 +169,19 @@ std::vector<std::string> SchemaDiscovery::list_prefixes(size_t depth,
     return result;
 }
 
+/**
+ * Attempts to infer a key pattern from sample data.
+ *
+ * Algorithm:
+ *   1. Sample N keys from the database
+ *   2. Count occurrences of common delimiters (##, ::, /, etc.)
+ *   3. Pick the most common delimiter
+ *   4. Split keys by that delimiter
+ *   5. Identify which segments are constant vs variable
+ *   6. Generate pattern with {colN} for variables, {attr} for last
+ *
+ * Returns nullopt if the database is empty or no pattern is detectable.
+ */
 std::optional<std::string> SchemaDiscovery::infer_pattern(size_t sample_count) {
     std::vector<std::string> samples;
     samples.reserve(sample_count);
@@ -149,7 +198,7 @@ std::optional<std::string> SchemaDiscovery::infer_pattern(size_t sample_count) {
         return std::nullopt;
     }
 
-    // Find the most common delimiter
+    // Count delimiter occurrences across all samples to find the primary delimiter
     std::unordered_map<std::string, size_t> delim_counts;
     for (const char* delim : COMMON_DELIMITERS) {
         for (const auto& key : samples) {
@@ -195,7 +244,8 @@ std::optional<std::string> SchemaDiscovery::infer_pattern(size_t sample_count) {
         return std::nullopt;
     }
 
-    // Analyze which parts are constant vs variable
+    // Compare each position across all samples to find constant vs variable segments.
+    // A segment is "variable" if different samples have different values there.
     std::vector<bool> is_constant(parts.size(), true);
     std::vector<std::unordered_set<std::string>> part_values(parts.size());
 
@@ -211,6 +261,7 @@ std::optional<std::string> SchemaDiscovery::infer_pattern(size_t sample_count) {
             key_parts.push_back(key.substr(start));
         }
 
+        // Only analyze keys with the same structure (same number of parts)
         if (key_parts.size() == parts.size()) {
             for (size_t i = 0; i < parts.size(); ++i) {
                 part_values[i].insert(key_parts[i]);
@@ -243,6 +294,22 @@ std::optional<std::string> SchemaDiscovery::infer_pattern(size_t sample_count) {
     return pattern.str();
 }
 
+/**
+ * Generates a CREATE FOREIGN TABLE statement from discovery results.
+ *
+ * Identity columns come from the pattern's capture names (e.g., {id}, {group}).
+ * Attr columns come from the discovered attr names in the data.
+ * All columns default to TEXT type (type inference is reserved for future).
+ *
+ * Example output:
+ *   CREATE FOREIGN TABLE users (
+ *       id TEXT,
+ *       name TEXT,
+ *       email TEXT
+ *   )
+ *   SERVER myserver
+ *   OPTIONS (key_pattern 'users##{id}##{attr}');
+ */
 std::string generate_foreign_table_sql(
     const std::string& table_name,
     const std::string& server_name,
@@ -256,7 +323,7 @@ std::string generate_foreign_table_sql(
 
     sql << "CREATE FOREIGN TABLE " << table_name << " (\n";
 
-    // Parse pattern to get identity columns
+    // Identity columns from pattern captures (form the row key)
     KeyPattern pattern(key_pattern);
     const auto& capture_names = pattern.capture_names();
 

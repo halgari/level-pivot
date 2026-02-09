@@ -1,3 +1,17 @@
+/**
+ * connection_manager.cpp - LevelDB connection management and pooling
+ *
+ * This module provides the interface between level_pivot and LevelDB:
+ *   - LevelDBIterator: Sequential access to key-value pairs
+ *   - LevelDBWriteBatch: Atomic multi-operation transactions
+ *   - LevelDBConnection: Single database connection with get/put/del
+ *   - ConnectionManager: Singleton that pools connections per PostgreSQL server
+ *
+ * Connection pooling is important because LevelDB only allows one process
+ * to open a database at a time. By caching connections per server OID,
+ * multiple foreign tables pointing to the same LevelDB can share a connection.
+ */
+
 #include "level_pivot/connection_manager.hpp"
 #include <leveldb/db.h>
 #include <leveldb/cache.h>
@@ -10,6 +24,11 @@ namespace level_pivot {
 
 // LevelDBIterator implementation
 
+/**
+ * Creates an iterator with caching enabled.
+ * fill_cache=true populates the block cache as we scan, which helps
+ * subsequent queries that access the same blocks.
+ */
 LevelDBIterator::LevelDBIterator(leveldb::DB* db) {
     leveldb::ReadOptions options;
     options.fill_cache = true;
@@ -55,6 +74,11 @@ std::string_view LevelDBIterator::key_view() const {
     return std::string_view(s.data(), s.size());
 }
 
+/**
+ * Returns value as string_view for zero-copy access.
+ * IMPORTANT: This view is only valid until next(), so callers must
+ * copy data they need to keep before advancing the iterator.
+ */
 std::string_view LevelDBIterator::value_view() const {
     auto s = iter_->value();
     return std::string_view(s.data(), s.size());
@@ -62,6 +86,11 @@ std::string_view LevelDBIterator::value_view() const {
 
 // LevelDBWriteBatch implementation
 
+/**
+ * WriteBatch accumulates operations in memory until commit().
+ * This is crucial for atomicity - either all operations succeed
+ * or none do. Also improves performance by reducing disk syncs.
+ */
 LevelDBWriteBatch::LevelDBWriteBatch(LevelDBConnection* connection)
     : connection_(connection), batch_(std::make_unique<leveldb::WriteBatch>()) {}
 
@@ -107,6 +136,12 @@ void LevelDBWriteBatch::del(const std::string& key) {
     ++pending_count_;
 }
 
+/**
+ * Applies all accumulated operations atomically to LevelDB.
+ * sync=false means we don't wait for fsync - the OS buffer cache
+ * provides durability for most crash scenarios. For critical data,
+ * consider enabling sync or using external durability guarantees.
+ */
 void LevelDBWriteBatch::commit() {
     if (committed_) {
         return;
@@ -144,6 +179,18 @@ bool LevelDBWriteBatch::has_pending() const {
 
 // LevelDBConnection implementation
 
+/**
+ * Opens a LevelDB database with the specified options.
+ *
+ * block_cache: LRU cache for frequently accessed data blocks.
+ *   Default 8MB is good for most workloads; increase for read-heavy.
+ *
+ * write_buffer_size: Memory used for buffering writes before flushing.
+ *   Larger values improve write throughput but increase memory usage.
+ *
+ * Note: LevelDB doesn't support true read-only mode, so we track it
+ * ourselves and reject writes if read_only=true.
+ */
 LevelDBConnection::LevelDBConnection(const ConnectionOptions& options)
     : path_(options.db_path), read_only_(options.read_only) {
 
@@ -227,6 +274,10 @@ void LevelDBConnection::check_write_allowed() {
 
 // ConnectionManager implementation
 
+/**
+ * Singleton pattern - one ConnectionManager per PostgreSQL backend process.
+ * Using static local variable ensures thread-safe initialization (C++11+).
+ */
 ConnectionManager& ConnectionManager::instance() {
     static ConnectionManager manager;
     return manager;
@@ -236,6 +287,15 @@ ConnectionManager::~ConnectionManager() {
     close_all();
 }
 
+/**
+ * Returns a connection for the given server, creating one if needed.
+ * Connections are keyed by server_oid, so all foreign tables using
+ * the same server share one LevelDB connection. This is required
+ * because LevelDB locks the database directory.
+ *
+ * Mutex protects against concurrent connection creation in
+ * parallel query execution scenarios.
+ */
 std::shared_ptr<LevelDBConnection> ConnectionManager::get_connection(
     unsigned int server_oid,
     const ConnectionOptions& options) {

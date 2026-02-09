@@ -1,11 +1,27 @@
+/**
+ * projection.cpp - Maps PostgreSQL table columns to key pattern segments
+ *
+ * A Projection bridges the gap between a foreign table's column definitions
+ * and the key pattern structure. For a table with columns (group, id, name, email)
+ * and pattern "users##{group}##{id}##{attr}":
+ *   - "group" and "id" are identity columns (they appear in the key pattern)
+ *   - "name" and "email" are attr columns (their names become {attr} values)
+ *
+ * The projection builds O(1) lookup maps for efficient access during scanning
+ * and writing, since these operations happen for every row processed.
+ */
+
 #include "level_pivot/projection.hpp"
 #include <algorithm>
 #include <stdexcept>
 
 namespace level_pivot {
 
-// PostgreSQL type OIDs (from pg_type.h)
-// These are stable across PostgreSQL versions
+/**
+ * PostgreSQL type OIDs from pg_type.h. These are stable across PostgreSQL
+ * versions so we can hardcode them instead of doing syscache lookups.
+ * This keeps the core library independent of PostgreSQL headers.
+ */
 namespace pg_oid {
     constexpr unsigned int BOOLOID = 16;
     constexpr unsigned int BYTEAOID = 17;
@@ -21,6 +37,11 @@ namespace pg_oid {
     constexpr unsigned int BPCHAROID = 1042;
 }
 
+/**
+ * Maps PostgreSQL type OIDs to our PgType enum. Unknown types default to TEXT
+ * since LevelDB stores everything as strings anyway - we can always round-trip
+ * through TEXT representation.
+ */
 PgType pg_type_from_oid(unsigned int oid) {
     switch (oid) {
         case pg_oid::BOOLOID:
@@ -72,6 +93,15 @@ Projection::Projection(const KeyPattern& pattern, std::vector<ColumnDef> columns
     validate();
 }
 
+/**
+ * Builds lookup indexes for O(1) column access during row processing.
+ * We need fast lookups because:
+ *   - column_to_identity_index_: Maps column position to identity value index
+ *     (used by DatumBuilder to fill identity columns from PivotRow)
+ *   - identity_name_to_index_: Maps capture name to column index
+ *   - attr_name_to_index_: Maps attr name to column index
+ *   - attr_names_: Set for fast "is this an attr?" checks during scanning
+ */
 void Projection::build_indexes() {
     identity_columns_.clear();
     attr_columns_.clear();
@@ -83,7 +113,8 @@ void Projection::build_indexes() {
     identity_name_to_index_.clear();
     attr_name_to_index_.clear();
 
-    // Build mapping from capture name to identity index
+    // Map capture names to their index in the parsed key's capture_values array.
+    // This ordering comes from the pattern and must match parse results.
     const auto& capture_names = parser_.pattern().capture_names();
     std::unordered_map<std::string, int> capture_to_index;
     for (size_t i = 0; i < capture_names.size(); ++i) {
@@ -93,20 +124,23 @@ void Projection::build_indexes() {
     for (size_t i = 0; i < columns_.size(); ++i) {
         const auto& col = columns_[i];
 
+        // Every column needs name and attnum lookups
         column_name_index_[col.name] = i;
         column_attnum_index_[col.attnum] = i;
 
         if (col.is_identity) {
-            // Build O(1) identity name lookup
+            // Identity columns map to capture values in parsed keys
             identity_name_to_index_[col.name] = static_cast<int>(identity_columns_.size());
             identity_columns_.push_back(&columns_[i]);
-            // Map column index to identity value index
+
+            // Pre-compute which identity_values index this column maps to.
+            // This allows O(1) lookup in DatumBuilder instead of name searches.
             auto it = capture_to_index.find(col.name);
             if (it != capture_to_index.end()) {
                 column_to_identity_index_[i] = it->second;
             }
         } else {
-            // Build O(1) attr name lookup
+            // Attr columns have their name used as the {attr} value in keys
             attr_name_to_index_[col.name] = static_cast<int>(attr_columns_.size());
             attr_columns_.push_back(&columns_[i]);
             attr_names_.insert(col.name);
@@ -114,10 +148,17 @@ void Projection::build_indexes() {
     }
 }
 
+/**
+ * Validates that the projection is consistent with the pattern:
+ *   - Number of identity columns must match pattern's capture count
+ *   - Identity column names must match capture names (order doesn't matter)
+ *   - No duplicate column names or attnums
+ *   - At least one attr column (otherwise nothing to pivot)
+ */
 void Projection::validate() const {
     const auto& pattern = parser_.pattern();
 
-    // Check that we have the right number of identity columns
+    // Identity column count must match capture count in pattern
     if (identity_columns_.size() != pattern.capture_count()) {
         throw std::invalid_argument(
             "Pattern has " + std::to_string(pattern.capture_count()) +
@@ -125,7 +166,7 @@ void Projection::validate() const {
             std::to_string(identity_columns_.size()) + " identity columns");
     }
 
-    // Check that identity column names match capture names
+    // Every identity column must correspond to a capture in the pattern
     const auto& capture_names = pattern.capture_names();
     for (size_t i = 0; i < identity_columns_.size(); ++i) {
         bool found = false;
@@ -142,7 +183,7 @@ void Projection::validate() const {
         }
     }
 
-    // Check for duplicate column names
+    // Column names must be unique
     std::unordered_set<std::string> seen_names;
     for (const auto& col : columns_) {
         if (seen_names.count(col.name)) {
@@ -151,7 +192,7 @@ void Projection::validate() const {
         seen_names.insert(col.name);
     }
 
-    // Check for duplicate attnums
+    // PostgreSQL attnums must be unique
     std::unordered_set<int> seen_attnums;
     for (const auto& col : columns_) {
         if (seen_attnums.count(col.attnum)) {
@@ -161,7 +202,7 @@ void Projection::validate() const {
         seen_attnums.insert(col.attnum);
     }
 
-    // Must have at least one attr column
+    // Must have at least one attr column to pivot
     if (attr_columns_.empty()) {
         throw std::invalid_argument("Projection must have at least one attr column");
     }

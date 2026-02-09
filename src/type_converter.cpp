@@ -1,3 +1,17 @@
+/**
+ * type_converter.cpp - Bidirectional PostgreSQL Datum <-> string conversion
+ *
+ * LevelDB stores everything as strings, so we need type conversion:
+ *   - string_to_datum: Parses strings from LevelDB into PostgreSQL values
+ *   - datum_to_string: Serializes PostgreSQL values for LevelDB storage
+ *
+ * Supported types: TEXT, INTEGER, BIGINT, BOOLEAN, NUMERIC, TIMESTAMP,
+ * TIMESTAMPTZ, DATE, JSONB, BYTEA. Unknown types fall back to TEXT.
+ *
+ * Memory: All allocations use palloc (PostgreSQL's memory allocator) so
+ * they're automatically freed when the current memory context is reset.
+ */
+
 // PostgreSQL headers must come first for Windows compatibility
 extern "C" {
 #include "postgres.h"
@@ -23,6 +37,15 @@ TypeConversionError::TypeConversionError(const std::string& value,
       value_(value),
       target_type_(target_type) {}
 
+/**
+ * Converts a string from LevelDB to a PostgreSQL Datum.
+ *
+ * Uses PostgreSQL's input functions (int4in, boolin, etc.) which handle
+ * the same formats as SQL literals. This means LevelDB values can use
+ * familiar formats like "true"/"false" for booleans, ISO dates, etc.
+ *
+ * BYTEA uses hex format with optional \x prefix for binary data.
+ */
 Datum TypeConverter::string_to_datum(const std::string& value, PgType type,
                                      bool& is_null) {
     is_null = false;
@@ -35,7 +58,7 @@ Datum TypeConverter::string_to_datum(const std::string& value, PgType type,
 
     switch (type) {
         case PgType::TEXT: {
-            // Create PostgreSQL text datum
+            // cstring_to_text_with_len handles non-null-terminated strings correctly
             text* result = cstring_to_text_with_len(value.c_str(), value.size());
             return PointerGetDatum(result);
         }
@@ -91,16 +114,19 @@ Datum TypeConverter::string_to_datum(const std::string& value, PgType type,
         }
 
         case PgType::BYTEA: {
-            // Assume hex format (\\x prefix optional)
+            // BYTEA uses hex encoding for safe string representation.
+            // Accept with or without \x prefix for flexibility.
             std::string hex_value = value;
             if (hex_value.substr(0, 2) == "\\x") {
                 hex_value = hex_value.substr(2);
             }
 
+            // Each byte is 2 hex chars; allocate PostgreSQL varlena structure
             size_t len = hex_value.size() / 2;
             bytea* result = (bytea*)palloc(VARHDRSZ + len);
             SET_VARSIZE(result, VARHDRSZ + len);
 
+            // Decode hex pairs to bytes using C++17 from_chars for speed
             unsigned char* data = (unsigned char*)VARDATA(result);
             for (size_t i = 0; i < len; ++i) {
                 unsigned int byte = 0;
@@ -121,6 +147,16 @@ Datum TypeConverter::string_to_datum(const std::string& value, PgType type,
     return (Datum)0;
 }
 
+/**
+ * Converts a PostgreSQL Datum to a string for LevelDB storage.
+ *
+ * Uses PostgreSQL's output functions for consistent formatting.
+ * The string representations are designed to round-trip correctly
+ * through string_to_datum.
+ *
+ * Note: pfree() is called for temporary strings returned by output
+ * functions to avoid memory leaks during bulk operations.
+ */
 std::string TypeConverter::datum_to_string(Datum datum, PgType type, bool is_null) {
     if (is_null) {
         return "";
@@ -128,6 +164,7 @@ std::string TypeConverter::datum_to_string(Datum datum, PgType type, bool is_nul
 
     switch (type) {
         case PgType::TEXT: {
+            // Direct access to varlena data avoids unnecessary copying
             text* txt = DatumGetTextPP(datum);
             return std::string(VARDATA_ANY(txt), VARSIZE_ANY_EXHDR(txt));
         }
@@ -208,11 +245,14 @@ std::string TypeConverter::datum_to_string(Datum datum, PgType type, bool is_nul
     return "";
 }
 
+/**
+ * Determines if a string should be treated as SQL NULL.
+ *
+ * Currently always returns false because in our model, NULL is
+ * represented by the absence of a key in LevelDB, not by a special
+ * value. If a key exists, it has a non-NULL value.
+ */
 bool TypeConverter::is_null_string(const std::string& value) {
-    // We don't treat empty strings as NULL
-    // Only explicit NULL markers would return true here
-    // For now, we return false - LevelDB values are never NULL unless
-    // the key doesn't exist
     (void)value;
     return false;
 }

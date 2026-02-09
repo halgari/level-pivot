@@ -1,5 +1,30 @@
 /**
- * FDW callback implementations for level_pivot
+ * fdw_handler.cpp - Core FDW callback implementations
+ *
+ * This is the main implementation file for the level_pivot FDW. It handles
+ * the full query lifecycle for both pivot and raw table modes:
+ *
+ * QUERY PLANNING (GetForeignRelSize, GetForeignPaths, GetForeignPlan):
+ *   - Estimates row counts for cost-based optimization
+ *   - Creates access paths (currently just sequential scan)
+ *   - Extracts pushable WHERE clauses (identity column equalities)
+ *
+ * SCAN EXECUTION (BeginForeignScan, IterateForeignScan, EndForeignScan):
+ *   - BeginForeignScan: Opens LevelDB connection, creates scanner
+ *   - IterateForeignScan: Returns rows one at a time
+ *   - EndForeignScan: Closes scanner, releases resources
+ *
+ * DML EXECUTION (BeginForeignModify, ExecForeignInsert/Update/Delete):
+ *   - Translates SQL DML to LevelDB put/delete operations
+ *   - Uses WriteBatch for atomicity when configured
+ *   - Sends NOTIFY on table modification
+ *
+ * SCHEMA IMPORT (ImportForeignSchema):
+ *   - Analyzes existing LevelDB data to infer table structure
+ *   - Generates CREATE FOREIGN TABLE statements
+ *
+ * The code branches on TableMode (PIVOT vs RAW) in most callbacks because
+ * the two modes have fundamentally different data models.
  */
 
 // PostgreSQL headers must come first for Windows compatibility
@@ -54,11 +79,14 @@ extern "C" {
 
 namespace {
 
-/* Type aliases to avoid macro comma issues with templates */
+/* Type aliases for stack-allocated arrays used in DML.
+ * TempArray avoids heap allocation for tables with < 64 columns. */
 using DatumTempArray = level_pivot::TempArray<Datum, 64>;
 using BoolTempArray = level_pivot::TempArray<bool, 64>;
 
-/* Table mode enum */
+/* Table mode determines the data access pattern:
+ * PIVOT: Keys are parsed by pattern, multiple keys become one row
+ * RAW: Direct key-value access, each key is one row */
 enum class TableMode { PIVOT, RAW };
 
 TableMode get_table_mode(ForeignTable *table)
@@ -77,7 +105,15 @@ TableMode get_table_mode(ForeignTable *table)
     return TableMode::PIVOT;  /* Default */
 }
 
-/* Base struct for common FDW state fields */
+/**
+ * Base class for FDW state structures.
+ *
+ * FDW state is allocated in a PostgreSQL MemoryContext and stored in
+ * node->fdw_state. It persists across IterateForeignScan calls.
+ *
+ * The cleanup pattern handles PostgreSQL's requirement that cleanup
+ * happens exactly once, even if EndForeignScan is called multiple times.
+ */
 struct FdwStateBase {
     std::shared_ptr<level_pivot::LevelDBConnection> connection;
     bool cleaned_up;
@@ -86,6 +122,7 @@ struct FdwStateBase {
     virtual ~FdwStateBase() = default;
 
 protected:
+    /* Returns false if already cleaned up (idempotent cleanup) */
     bool begin_cleanup() {
         if (cleaned_up)
             return false;
@@ -201,14 +238,18 @@ struct RawModifyState : ModifyStateBase {
     }
 };
 
-/* Helper function for building NOTIFY channel name */
+/**
+ * Builds NOTIFY channel name from schema and table.
+ *
+ * Format: {schema}_{table}_changed
+ * This allows clients to LISTEN for changes to specific tables.
+ * PostgreSQL limits channel names to 63 characters.
+ */
 static std::string
 build_notify_channel(const std::string& schema_name, const std::string& table_name)
 {
-    // Build channel: {schema}_{table}_changed
     std::string channel = schema_name + "_" + table_name + "_changed";
 
-    // PostgreSQL channel names max 63 chars
     if (channel.length() > 63)
         channel = channel.substr(0, 63);
 
@@ -667,21 +708,29 @@ find_column_attnum(Relation rel, const char *name)
 extern "C" {
 
 /*
- * GetForeignRelSize
- *      Estimate the size of the foreign relation
+ * GetForeignRelSize - Estimate row count for query planning.
+ *
+ * PostgreSQL uses this for cost estimation. A more accurate estimate
+ * would sample LevelDB, but 1000 is a reasonable default that doesn't
+ * add overhead. The actual row count doesn't affect correctness.
  */
 void
 levelPivotGetForeignRelSize(PlannerInfo *root,
                             RelOptInfo *baserel,
                             Oid foreigntableid)
 {
-    /* For now, use a simple estimate */
-    baserel->rows = 1000;
+    baserel->rows = 1000;  /* TODO: could sample for better estimates */
 }
 
 /*
- * GetForeignPaths
- *      Create possible access paths for the foreign table
+ * GetForeignPaths - Create access path for the foreign table.
+ *
+ * Currently we only support sequential scan. Future optimization could add:
+ *   - Index path when filtering on identity columns (uses LevelDB prefix seek)
+ *   - Parameterized paths for nested loop joins
+ *
+ * Cost model: startup_cost + (rows * per_row_cost)
+ * The per_row_cost (0.01) is a rough estimate for LevelDB iteration.
  */
 void
 levelPivotGetForeignPaths(PlannerInfo *root,
@@ -691,7 +740,6 @@ levelPivotGetForeignPaths(PlannerInfo *root,
     Cost startup_cost = 10;
     Cost total_cost = startup_cost + baserel->rows * 0.01;
 
-    /* Create a single ForeignPath */
     add_path(baserel, (Path *)
              create_foreignscan_path(root, baserel,
                                     NULL,    /* default pathtarget */
@@ -699,23 +747,25 @@ levelPivotGetForeignPaths(PlannerInfo *root,
                                     0,       /* disabled_nodes */
                                     startup_cost,
                                     total_cost,
-                                    NIL,     /* no pathkeys */
+                                    NIL,     /* no pathkeys (unsorted) */
                                     baserel->lateral_relids,
                                     NULL,    /* no extra plan */
                                     NIL,     /* no fdw_restrictinfo */
-                                    NIL));   /* no fdw_private */
+                                    NIL));   /* no fdw_private yet */
 }
 
 /*
- * GetForeignPlan
- *      Create a ForeignScan plan node
+ * GetForeignPlan - Build the final scan plan with pushed-down predicates.
  *
- * For pivot tables: extracts equality conditions on identity columns.
- * For raw tables: extracts comparison conditions on the 'key' column.
+ * This is where filter pushdown happens. We scan WHERE clauses looking for:
+ *   - Pivot mode: "identity_column = constant" (uses LevelDB prefix seek)
+ *   - Raw mode: "key op constant" where op is =, <, <=, >, >= (uses seek + bounds)
  *
- * fdw_private format:
- *   - Pivot mode: (attnum, value) pairs for identity column filters
- *   - Raw mode: -1 marker, then (strategy, value) pairs for key predicates
+ * Pushed predicates are stored in fdw_private for use by BeginForeignScan:
+ *   - Pivot mode: [(attnum, value), ...] pairs
+ *   - Raw mode: [-1, (strategy, value), ...] with BTStrategy constants
+ *
+ * Non-pushable predicates remain in scan_clauses for PostgreSQL to evaluate.
  */
 ForeignScan *
 levelPivotGetForeignPlan(PlannerInfo *root,
@@ -823,12 +873,19 @@ levelPivotGetForeignPlan(PlannerInfo *root,
 }
 
 /*
- * BeginForeignScan
- *      Initialize the scan state
+ * BeginForeignScan - Initialize scan state before iteration.
+ *
+ * Creates scanner (PivotScanner or RawScanner) and opens LevelDB connection.
+ * The scanner is positioned using pushed-down predicates from fdw_private.
+ *
+ * Memory management: We create a dedicated MemoryContext for scan state
+ * that lives until EndForeignScan. A child "temp" context is reset after
+ * each row to avoid memory growth during large scans.
  */
 void
 levelPivotBeginForeignScan(ForeignScanState *node, int eflags)
 {
+    /* EXPLAIN ANALYZE still calls this but doesn't iterate */
     if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
         return;
 
@@ -907,8 +964,14 @@ levelPivotBeginForeignScan(ForeignScanState *node, int eflags)
 }
 
 /*
- * IterateForeignScan
- *      Fetch one row from the foreign table
+ * IterateForeignScan - Return the next row, or empty slot if done.
+ *
+ * This is the hot path - called once per row. Key optimizations:
+ *   - Uses temp_context that's reset per row (avoids palloc accumulation)
+ *   - PivotScanner uses zero-copy string_views until row is complete
+ *   - DatumBuilder pre-computes column index mappings
+ *
+ * Returns an empty slot (ExecClearTuple) to signal end of scan.
  */
 TupleTableSlot *
 levelPivotIterateForeignScan(ForeignScanState *node)
@@ -918,7 +981,7 @@ levelPivotIterateForeignScan(ForeignScanState *node)
     ForeignTable *table = GetForeignTable(RelationGetRelid(rel));
     TableMode mode = get_table_mode(table);
 
-    ExecClearTuple(slot);
+    ExecClearTuple(slot);  /* Signal no more rows if we return early */
 
     if (mode == TableMode::RAW) {
         /* Raw mode iteration */
@@ -1177,8 +1240,14 @@ levelPivotExplainForeignScan(ForeignScanState *node, ExplainState *es)
 }
 
 /*
- * AddForeignUpdateTargets
- *      Add resjunk columns needed for UPDATE/DELETE
+ * AddForeignUpdateTargets - Tell PostgreSQL what we need to identify rows.
+ *
+ * For UPDATE/DELETE, PostgreSQL needs to pass us the "old" row values
+ * so we can find the right keys to modify. We request the whole row
+ * as a junk attribute (not returned to user, just used internally).
+ *
+ * Alternative: Could use just identity columns, but whole row is simpler
+ * and handles edge cases like identity column changes in UPDATE.
  */
 void
 levelPivotAddForeignUpdateTargets(PlannerInfo *root,
@@ -1186,7 +1255,6 @@ levelPivotAddForeignUpdateTargets(PlannerInfo *root,
                                   RangeTblEntry *target_rte,
                                   Relation target_relation)
 {
-    /* Use whole row as the row identifier for both modes */
     Var *var = makeWholeRowVar(target_rte, rtindex, 0, false);
     add_row_identity_var(root, var, rtindex, "wholerow");
 }
@@ -1206,8 +1274,13 @@ levelPivotPlanForeignModify(PlannerInfo *root,
 }
 
 /*
- * BeginForeignModify
- *      Initialize the modify state
+ * BeginForeignModify - Initialize state for INSERT/UPDATE/DELETE.
+ *
+ * Creates Writer (or RawWriter) with optional WriteBatch support.
+ * WriteBatch provides atomicity: all row modifications in a statement
+ * either succeed together or fail together.
+ *
+ * Also captures schema/table names for NOTIFY support.
  */
 void
 levelPivotBeginForeignModify(ModifyTableState *mtstate,
@@ -1510,8 +1583,14 @@ levelPivotExecForeignDelete(EState *estate,
 }
 
 /*
- * EndForeignModify
- *      Clean up the modify state
+ * EndForeignModify - Commit changes and clean up.
+ *
+ * This is called after the last row modification. Key responsibilities:
+ *   1. Commit WriteBatch (applies all accumulated operations atomically)
+ *   2. Send NOTIFY if any modifications occurred
+ *   3. Release writer and connection resources
+ *
+ * NOTIFY is sent after commit so listeners see consistent data.
  */
 void
 levelPivotEndForeignModify(EState *estate, ResultRelInfo *rinfo)
@@ -1527,12 +1606,12 @@ levelPivotEndForeignModify(EState *estate, ResultRelInfo *rinfo)
         auto state = static_cast<RawModifyState *>(rinfo->ri_FdwState);
 
         PG_TRY_CPP({
-            /* Commit batch if using batched writes */
+            /* Commit makes all accumulated operations visible atomically */
             if (state->writer && state->use_write_batch) {
                 state->writer->commit_batch();
             }
 
-            /* Send NOTIFY if modifications occurred */
+            /* NOTIFY lets LISTEN clients react to changes */
             if (state->has_modifications) {
                 send_table_changed_notify(state->schema_name, state->table_name);
             }
@@ -1586,8 +1665,19 @@ levelPivotIsForeignRelUpdatable(Relation rel)
 }
 
 /*
- * ImportForeignSchema
- *      Generate CREATE FOREIGN TABLE statements for discovered attrs
+ * ImportForeignSchema - Auto-generate table definitions from LevelDB data.
+ *
+ * Called by: IMPORT FOREIGN SCHEMA remote_schema FROM SERVER srv INTO local_schema;
+ *
+ * Algorithm:
+ *   1. Sample keys to infer delimiter and structure
+ *   2. Identify constant vs variable segments
+ *   3. Generate pattern with {colN} placeholders
+ *   4. Scan for all attr names (the {attr} values)
+ *   5. Generate CREATE FOREIGN TABLE with discovered columns
+ *
+ * This is a best-effort heuristic. Complex key structures may need
+ * manual table definitions.
  */
 List *
 levelPivotImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
@@ -1598,14 +1688,12 @@ levelPivotImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
         ForeignServer *server = GetForeignServer(serverOid);
         auto conn_options = get_server_options(server);
 
-        /* Get connection */
         auto connection = level_pivot::ConnectionManager::instance()
             .get_connection(server->serverid, conn_options);
 
-        /* Create schema discovery */
         level_pivot::SchemaDiscovery discovery(connection);
 
-        /* Try to infer a pattern from the data */
+        /* Infer pattern by analyzing key structure across samples */
         auto pattern_str = discovery.infer_pattern(1000);
 
         if (pattern_str)
