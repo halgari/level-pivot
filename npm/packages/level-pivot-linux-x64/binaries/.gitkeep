@@ -1,0 +1,3 @@
+# Placeholder for level_pivot.so binary
+# This file is populated by CI or the build script
+# Run `npm run build:binary` from the project root to build

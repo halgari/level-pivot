@@ -1,0 +1,5 @@
+# level_pivot extension
+comment = 'Foreign Data Wrapper for LevelDB with pivot semantics'
+default_version = '1.0'
+module_pathname = '$libdir/level_pivot'
+relocatable = true

@@ -1,0 +1,52 @@
+{
+  "name": "@halgari/level-pivot",
+  "version": "0.1.0",
+  "description": "Embedded PostgreSQL with LevelDB foreign data wrapper - query LevelDB using SQL",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src --ext .ts",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "leveldb",
+    "postgresql",
+    "embedded",
+    "fdw",
+    "foreign-data-wrapper",
+    "sql",
+    "electron"
+  ],
+  "author": "halgari",
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/halgari/level-pivot.git",
+    "directory": "npm/packages/level-pivot"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "embedded-postgres": "^18.1.0-beta.16",
+    "pg": "^8.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/pg": "^8.10.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "eslint": "^8.0.0",
+    "typescript": "^5.3.0",
+    "vitest": "^1.0.0"
+  },
+  "optionalDependencies": {
+    "@halgari/level-pivot-linux-x64": "0.1.0"
+  }
+}

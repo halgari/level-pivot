@@ -1,0 +1,31 @@
+{
+  "name": "@halgari/level-pivot-linux-x64",
+  "version": "0.1.0",
+  "description": "Linux x64 binaries for @halgari/level-pivot",
+  "main": "index.js",
+  "scripts": {
+    "build": "echo 'No build needed for binary package'",
+    "test": "echo 'No tests for binary package'"
+  },
+  "files": [
+    "index.js",
+    "binaries",
+    "sql"
+  ],
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "keywords": [
+    "leveldb",
+    "postgresql",
+    "level-pivot",
+    "binary",
+    "linux"
+  ],
+  "author": "halgari",
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/halgari/level-pivot.git",
+    "directory": "npm/packages/level-pivot-linux-x64"
+  }
+}
