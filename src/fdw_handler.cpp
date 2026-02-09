@@ -14,6 +14,7 @@ extern "C" {
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
+#include "commands/async.h"  // For Async_Notify
 #include "commands/defrem.h"
 #include "commands/explain.h"
 #include "commands/explain_format.h"
@@ -137,7 +138,12 @@ struct LevelPivotModifyState {
     bool use_write_batch;
     bool cleaned_up;
 
-    LevelPivotModifyState() : num_cols(0), attr_map(nullptr), use_write_batch(true), cleaned_up(false) {}
+    // NOTIFY support
+    std::string schema_name;
+    std::string table_name;
+    bool has_modifications;
+
+    LevelPivotModifyState() : num_cols(0), attr_map(nullptr), use_write_batch(true), cleaned_up(false), has_modifications(false) {}
 
     ~LevelPivotModifyState() { cleanup(); }
 
@@ -165,7 +171,12 @@ struct RawModifyState {
     bool use_write_batch;
     bool cleaned_up;
 
-    RawModifyState() : key_attnum(0), value_attnum(0), use_write_batch(true), cleaned_up(false) {}
+    // NOTIFY support
+    std::string schema_name;
+    std::string table_name;
+    bool has_modifications;
+
+    RawModifyState() : key_attnum(0), value_attnum(0), use_write_batch(true), cleaned_up(false), has_modifications(false) {}
 
     ~RawModifyState() { cleanup(); }
 
@@ -181,6 +192,28 @@ struct RawModifyState {
         connection.reset();
     }
 };
+
+/* Helper function for building NOTIFY channel name */
+static std::string
+build_notify_channel(const std::string& schema_name, const std::string& table_name)
+{
+    // Build channel: {schema}_{table}_changed
+    std::string channel = schema_name + "_" + table_name + "_changed";
+
+    // PostgreSQL channel names max 63 chars
+    if (channel.length() > 63)
+        channel = channel.substr(0, 63);
+
+    return channel;
+}
+
+/* Helper function for NOTIFY support */
+static void
+send_table_changed_notify(const std::string& schema_name, const std::string& table_name)
+{
+    std::string channel = build_notify_channel(schema_name, table_name);
+    Async_Notify(channel.c_str(), NULL);
+}
 
 /* Helper functions */
 
@@ -1213,6 +1246,10 @@ levelPivotBeginForeignModify(ModifyTableState *mtstate,
             state->key_attnum = find_column_attnum(rel, "key");
             state->value_attnum = find_column_attnum(rel, "value");
 
+            /* Capture table metadata for NOTIFY */
+            state->schema_name = get_namespace_name(RelationGetNamespace(rel));
+            state->table_name = RelationGetRelationName(rel);
+
             rinfo->ri_FdwState = state;
         } else {
             /* Pivot mode: use Writer */
@@ -1244,6 +1281,10 @@ levelPivotBeginForeignModify(ModifyTableState *mtstate,
             /* Store column count */
             TupleDesc tupdesc = RelationGetDescr(rel);
             state->num_cols = tupdesc->natts;
+
+            /* Capture table metadata for NOTIFY */
+            state->schema_name = get_namespace_name(RelationGetNamespace(rel));
+            state->table_name = RelationGetRelationName(rel);
 
             rinfo->ri_FdwState = state;
         }
@@ -1283,6 +1324,7 @@ levelPivotExecForeignInsert(EState *estate,
                 value = TextDatumGetCString(slot->tts_values[val_idx]);
 
             state->writer->insert(key, value);
+            state->has_modifications = true;
             return slot;
         }, slot);
     } else {
@@ -1291,6 +1333,7 @@ levelPivotExecForeignInsert(EState *estate,
         PG_TRY_CPP_RETURN({
             slot_getallattrs(slot);
             state->writer->insert(slot->tts_values, slot->tts_isnull);
+            state->has_modifications = true;
             return slot;
         }, slot);
     }
@@ -1344,6 +1387,7 @@ levelPivotExecForeignUpdate(EState *estate,
                 new_value = TextDatumGetCString(slot->tts_values[val_idx]);
 
             state->writer->update(key, new_value);
+            state->has_modifications = true;
             return slot;
         }, slot);
     } else {
@@ -1376,6 +1420,7 @@ levelPivotExecForeignUpdate(EState *estate,
             state->writer->update(old_values.data(), old_nulls.data(),
                                  slot->tts_values, slot->tts_isnull);
 
+            state->has_modifications = true;
             return slot;
         }, slot);
     }
@@ -1420,6 +1465,7 @@ levelPivotExecForeignDelete(EState *estate,
 
             std::string key = TextDatumGetCString(key_datum);
             state->writer->remove(key);
+            state->has_modifications = true;
 
             return slot;
         }, slot);
@@ -1448,6 +1494,7 @@ levelPivotExecForeignDelete(EState *estate,
             }
 
             state->writer->remove(values.data(), nulls.data());
+            state->has_modifications = true;
 
             return slot;
         }, slot);
@@ -1476,6 +1523,11 @@ levelPivotEndForeignModify(EState *estate, ResultRelInfo *rinfo)
             if (state->writer && state->use_write_batch) {
                 state->writer->commit_batch();
             }
+
+            /* Send NOTIFY if modifications occurred */
+            if (state->has_modifications) {
+                send_table_changed_notify(state->schema_name, state->table_name);
+            }
         });
 
         state->cleanup();
@@ -1486,6 +1538,11 @@ levelPivotEndForeignModify(EState *estate, ResultRelInfo *rinfo)
             /* Commit batch if using batched writes */
             if (state->writer && state->use_write_batch) {
                 state->writer->commit_batch();
+            }
+
+            /* Send NOTIFY if modifications occurred */
+            if (state->has_modifications) {
+                send_table_changed_notify(state->schema_name, state->table_name);
             }
         });
 

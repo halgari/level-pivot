@@ -85,6 +85,11 @@ if [[ $FAILED -eq 0 ]]; then
         run_test "${SCRIPT_DIR}/test_raw.sql" || FAILED=1
     fi
 
+    # Run NOTIFY tests
+    if [[ -f "${SCRIPT_DIR}/test_notify.sql" ]]; then
+        run_test "${SCRIPT_DIR}/test_notify.sql" || FAILED=1
+    fi
+
     # Run cleanup
     run_test "${SCRIPT_DIR}/cleanup.sql" || FAILED=1
 fi
