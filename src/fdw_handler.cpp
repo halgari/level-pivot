@@ -38,6 +38,8 @@ extern "C" {
 #include "level_pivot/key_parser.hpp"
 #include "level_pivot/projection.hpp"
 #include "level_pivot/pivot_scanner.hpp"
+#include "level_pivot/raw_scanner.hpp"
+#include "level_pivot/raw_writer.hpp"
 #include "level_pivot/connection_manager.hpp"
 #include "level_pivot/type_converter.hpp"
 #include "level_pivot/writer.hpp"
@@ -54,6 +56,25 @@ namespace {
 /* Type aliases to avoid macro comma issues with templates */
 using DatumTempArray = level_pivot::TempArray<Datum, 64>;
 using BoolTempArray = level_pivot::TempArray<bool, 64>;
+
+/* Table mode enum */
+enum class TableMode { PIVOT, RAW };
+
+TableMode get_table_mode(ForeignTable *table)
+{
+    ListCell *cell;
+    foreach(cell, table->options)
+    {
+        DefElem *def = (DefElem *) lfirst(cell);
+        if (strcmp(def->defname, "table_mode") == 0)
+        {
+            std::string mode(defGetString(def));
+            if (mode == "raw")
+                return TableMode::RAW;
+        }
+    }
+    return TableMode::PIVOT;  /* Default */
+}
 
 /* Scan state structure */
 struct LevelPivotScanState {
@@ -82,6 +103,30 @@ struct LevelPivotScanState {
     }
 };
 
+/* Raw scan state structure for raw table mode */
+struct RawScanState {
+    std::unique_ptr<level_pivot::RawScanner> scanner;
+    std::shared_ptr<level_pivot::LevelDBConnection> connection;
+    level_pivot::RawScanBounds bounds;
+    MemoryContext temp_context;
+    bool cleaned_up;
+
+    RawScanState() : temp_context(nullptr), cleaned_up(false) {}
+
+    ~RawScanState() { cleanup(); }
+
+    void cleanup() {
+        if (cleaned_up)
+            return;
+        cleaned_up = true;
+
+        if (scanner)
+            scanner->end_scan();
+        scanner.reset();
+        connection.reset();
+    }
+};
+
 /* Modify state structure */
 struct LevelPivotModifyState {
     std::unique_ptr<level_pivot::Projection> projection;
@@ -107,6 +152,32 @@ struct LevelPivotModifyState {
         }
         writer.reset();
         projection.reset();
+        connection.reset();
+    }
+};
+
+/* Raw modify state structure for raw table mode */
+struct RawModifyState {
+    std::unique_ptr<level_pivot::RawWriter> writer;
+    std::shared_ptr<level_pivot::LevelDBConnection> connection;
+    AttrNumber key_attnum;    // Attribute number of the 'key' column
+    AttrNumber value_attnum;  // Attribute number of the 'value' column
+    bool use_write_batch;
+    bool cleaned_up;
+
+    RawModifyState() : key_attnum(0), value_attnum(0), use_write_batch(true), cleaned_up(false) {}
+
+    ~RawModifyState() { cleanup(); }
+
+    void cleanup() {
+        if (cleaned_up)
+            return;
+        cleaned_up = true;
+
+        if (writer && writer->is_batched()) {
+            writer->discard_batch();
+        }
+        writer.reset();
         connection.reset();
     }
 };
@@ -342,6 +413,214 @@ is_pushable_equality(Expr *clause, RelOptInfo *baserel,
     return true;
 }
 
+/**
+ * Extract raw key predicate from a comparison clause.
+ *
+ * For raw tables, we support predicates on the 'key' column:
+ *   - key = 'value' (exact match)
+ *   - key > 'value', key >= 'value' (lower bound)
+ *   - key < 'value', key <= 'value' (upper bound)
+ *
+ * @param clause The expression to check
+ * @param baserel The relation being scanned
+ * @param key_attnum Attribute number of the 'key' column
+ * @param strategy Output: BTLessStrategyNumber, BTLessEqualStrategyNumber,
+ *                 BTEqualStrategyNumber, BTGreaterEqualStrategyNumber, or BTGreaterStrategyNumber
+ * @param value Output: the constant value (must be pfree'd by caller)
+ * @return true if this is a pushable key predicate
+ */
+static bool
+extract_raw_key_predicate(Expr *clause, RelOptInfo *baserel,
+                          AttrNumber key_attnum,
+                          int *strategy, char **value)
+{
+    /* Must be an OpExpr */
+    if (!IsA(clause, OpExpr))
+        return false;
+
+    OpExpr *op = (OpExpr *) clause;
+
+    /* Must have exactly 2 arguments */
+    if (list_length(op->args) != 2)
+        return false;
+
+    /* Look up the operator */
+    HeapTuple opertup = SearchSysCache1(OPEROID, ObjectIdGetDatum(op->opno));
+    if (!HeapTupleIsValid(opertup))
+        return false;
+
+    Form_pg_operator operform = (Form_pg_operator) GETSTRUCT(opertup);
+
+    /* Check if result is boolean */
+    if (operform->oprresult != BOOLOID) {
+        ReleaseSysCache(opertup);
+        return false;
+    }
+
+    /* Determine strategy from operator name */
+    const char *oprname = NameStr(operform->oprname);
+    int strat = 0;
+    bool swap_operands = false;
+
+    if (strcmp(oprname, "=") == 0)
+        strat = BTEqualStrategyNumber;
+    else if (strcmp(oprname, "<") == 0)
+        strat = BTLessStrategyNumber;
+    else if (strcmp(oprname, "<=") == 0)
+        strat = BTLessEqualStrategyNumber;
+    else if (strcmp(oprname, ">") == 0)
+        strat = BTGreaterStrategyNumber;
+    else if (strcmp(oprname, ">=") == 0)
+        strat = BTGreaterEqualStrategyNumber;
+    else {
+        ReleaseSysCache(opertup);
+        return false;
+    }
+
+    ReleaseSysCache(opertup);
+
+    Expr *left = (Expr *) linitial(op->args);
+    Expr *right = (Expr *) lsecond(op->args);
+
+    /* Look for Var op Const pattern (either direction) */
+    Var *var = NULL;
+    Const *constval = NULL;
+
+    if (IsA(left, Var) && IsA(right, Const)) {
+        var = (Var *) left;
+        constval = (Const *) right;
+    } else if (IsA(left, Const) && IsA(right, Var)) {
+        var = (Var *) right;
+        constval = (Const *) left;
+        swap_operands = true;
+    } else {
+        return false;
+    }
+
+    /* Check if var is from this relation and is the key column */
+    if (var->varno != baserel->relid || var->varattno != key_attnum)
+        return false;
+
+    /* Must not be NULL */
+    if (constval->constisnull)
+        return false;
+
+    /* If operands were swapped, flip the comparison direction */
+    if (swap_operands) {
+        switch (strat) {
+            case BTLessStrategyNumber:
+                strat = BTGreaterStrategyNumber;
+                break;
+            case BTLessEqualStrategyNumber:
+                strat = BTGreaterEqualStrategyNumber;
+                break;
+            case BTGreaterStrategyNumber:
+                strat = BTLessStrategyNumber;
+                break;
+            case BTGreaterEqualStrategyNumber:
+                strat = BTLessEqualStrategyNumber;
+                break;
+            /* BTEqualStrategyNumber stays the same */
+        }
+    }
+
+    /* Convert Datum to string */
+    char *val = NULL;
+    Oid typid = constval->consttype;
+
+    if (typid == TEXTOID || typid == VARCHAROID || typid == BPCHAROID) {
+        val = TextDatumGetCString(constval->constvalue);
+    } else {
+        /* For other types, use output function */
+        Oid typoutput;
+        bool typIsVarlena;
+        getTypeOutputInfo(typid, &typoutput, &typIsVarlena);
+        val = OidOutputFunctionCall(typoutput, constval->constvalue);
+    }
+
+    *strategy = strat;
+    *value = val;
+    return true;
+}
+
+/**
+ * Build RawScanBounds from fdw_private list.
+ *
+ * fdw_private format for raw tables:
+ *   - First element: Integer marker (-1 for raw mode)
+ *   - Subsequent pairs: (strategy, value) for each predicate
+ */
+static level_pivot::RawScanBounds
+build_raw_bounds_from_fdw_private(List *fdw_private)
+{
+    level_pivot::RawScanBounds bounds;
+
+    if (fdw_private == NIL)
+        return bounds;
+
+    ListCell *cell = list_head(fdw_private);
+
+    /* Skip the mode marker */
+    if (cell != NULL) {
+        int marker = intVal(lfirst(cell));
+        if (marker != -1)
+            return bounds;  /* Not a raw mode private list */
+        cell = lnext(fdw_private, cell);
+    }
+
+    /* Process (strategy, value) pairs */
+    while (cell != NULL)
+    {
+        int strategy = intVal(lfirst(cell));
+        cell = lnext(fdw_private, cell);
+        if (cell == NULL)
+            break;
+        char *value = strVal(lfirst(cell));
+        cell = lnext(fdw_private, cell);
+
+        switch (strategy) {
+            case BTEqualStrategyNumber:
+                bounds.exact_key = std::string(value);
+                break;
+            case BTLessStrategyNumber:
+                bounds.upper_bound = std::string(value);
+                bounds.upper_inclusive = false;
+                break;
+            case BTLessEqualStrategyNumber:
+                bounds.upper_bound = std::string(value);
+                bounds.upper_inclusive = true;
+                break;
+            case BTGreaterStrategyNumber:
+                bounds.lower_bound = std::string(value);
+                bounds.lower_inclusive = false;
+                break;
+            case BTGreaterEqualStrategyNumber:
+                bounds.lower_bound = std::string(value);
+                bounds.lower_inclusive = true;
+                break;
+        }
+    }
+
+    return bounds;
+}
+
+/**
+ * Find the attribute number of a column by name in a relation.
+ */
+static AttrNumber
+find_column_attnum(Relation rel, const char *name)
+{
+    TupleDesc tupdesc = RelationGetDescr(rel);
+    for (int i = 0; i < tupdesc->natts; i++) {
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+        if (attr->attisdropped)
+            continue;
+        if (strcmp(NameStr(attr->attname), name) == 0)
+            return attr->attnum;
+    }
+    return InvalidAttrNumber;
+}
+
 } // anonymous namespace
 
 extern "C" {
@@ -390,8 +669,12 @@ levelPivotGetForeignPaths(PlannerInfo *root,
  * GetForeignPlan
  *      Create a ForeignScan plan node
  *
- * Extracts equality conditions on identity columns for filter pushdown.
- * The fdw_private list stores (attnum, value) pairs for pushable filters.
+ * For pivot tables: extracts equality conditions on identity columns.
+ * For raw tables: extracts comparison conditions on the 'key' column.
+ *
+ * fdw_private format:
+ *   - Pivot mode: (attnum, value) pairs for identity column filters
+ *   - Raw mode: -1 marker, then (strategy, value) pairs for key predicates
  */
 ForeignScan *
 levelPivotGetForeignPlan(PlannerInfo *root,
@@ -405,54 +688,82 @@ levelPivotGetForeignPlan(PlannerInfo *root,
     Index scan_relid = baserel->relid;
     List *fdw_private = NIL;
 
-    /*
-     * Get the key pattern to determine identity columns.
-     * We need to know which columns are identity columns to determine
-     * which filters can be pushed down.
-     */
     ForeignTable *table = GetForeignTable(foreigntableid);
-    std::string key_pattern = get_table_option(table, "key_pattern");
+    TableMode mode = get_table_mode(table);
 
-    if (!key_pattern.empty()) {
-        /* Parse the key pattern to get capture names */
-        level_pivot::KeyPattern pattern(key_pattern);
-        const auto& capture_names = pattern.capture_names();
-
-        /* Build a map from column name to attnum for identity columns */
+    if (mode == TableMode::RAW) {
+        /* Raw mode: extract key predicates */
         RangeTblEntry *rte = planner_rt_fetch(baserel->relid, root);
         Relation rel = table_open(rte->relid, NoLock);
-        TupleDesc tupdesc = RelationGetDescr(rel);
 
-        /* Collect attnums of identity columns */
-        std::vector<AttrNumber> identity_attnums;
-        for (int i = 0; i < tupdesc->natts; i++) {
-            Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
-            if (attr->attisdropped)
-                continue;
+        /* Find the 'key' column */
+        AttrNumber key_attnum = find_column_attnum(rel, "key");
+        table_close(rel, NoLock);
 
-            std::string col_name = NameStr(attr->attname);
-            for (const auto& cap_name : capture_names) {
-                if (col_name == cap_name) {
-                    identity_attnums.push_back(attr->attnum);
-                    break;
+        if (key_attnum != InvalidAttrNumber) {
+            /* Mark this as raw mode with -1 */
+            fdw_private = lappend(fdw_private, makeInteger(-1));
+
+            /* Extract key predicates from scan_clauses */
+            ListCell *cell;
+            foreach(cell, scan_clauses) {
+                RestrictInfo *rinfo = lfirst_node(RestrictInfo, cell);
+                Expr *clause = rinfo->clause;
+
+                int strategy;
+                char *value;
+                if (extract_raw_key_predicate(clause, baserel, key_attnum,
+                                              &strategy, &value)) {
+                    fdw_private = lappend(fdw_private, makeInteger(strategy));
+                    fdw_private = lappend(fdw_private, makeString(pstrdup(value)));
                 }
             }
         }
-        table_close(rel, NoLock);
+    } else {
+        /* Pivot mode: extract identity column filters */
+        std::string key_pattern = get_table_option(table, "key_pattern");
 
-        /* Extract pushable equality conditions from scan_clauses */
-        ListCell *cell;
-        foreach(cell, scan_clauses) {
-            RestrictInfo *rinfo = lfirst_node(RestrictInfo, cell);
-            Expr *clause = rinfo->clause;
+        if (!key_pattern.empty()) {
+            /* Parse the key pattern to get capture names */
+            level_pivot::KeyPattern pattern(key_pattern);
+            const auto& capture_names = pattern.capture_names();
 
-            AttrNumber attnum;
-            char *value;
-            if (is_pushable_equality(clause, baserel, identity_attnums,
-                                     &attnum, &value)) {
-                /* Store (attnum, value) pair in fdw_private */
-                fdw_private = lappend(fdw_private, makeInteger(attnum));
-                fdw_private = lappend(fdw_private, makeString(pstrdup(value)));
+            /* Build a map from column name to attnum for identity columns */
+            RangeTblEntry *rte = planner_rt_fetch(baserel->relid, root);
+            Relation rel = table_open(rte->relid, NoLock);
+            TupleDesc tupdesc = RelationGetDescr(rel);
+
+            /* Collect attnums of identity columns */
+            std::vector<AttrNumber> identity_attnums;
+            for (int i = 0; i < tupdesc->natts; i++) {
+                Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+                if (attr->attisdropped)
+                    continue;
+
+                std::string col_name = NameStr(attr->attname);
+                for (const auto& cap_name : capture_names) {
+                    if (col_name == cap_name) {
+                        identity_attnums.push_back(attr->attnum);
+                        break;
+                    }
+                }
+            }
+            table_close(rel, NoLock);
+
+            /* Extract pushable equality conditions from scan_clauses */
+            ListCell *cell;
+            foreach(cell, scan_clauses) {
+                RestrictInfo *rinfo = lfirst_node(RestrictInfo, cell);
+                Expr *clause = rinfo->clause;
+
+                AttrNumber attnum;
+                char *value;
+                if (is_pushable_equality(clause, baserel, identity_attnums,
+                                         &attnum, &value)) {
+                    /* Store (attnum, value) pair in fdw_private */
+                    fdw_private = lappend(fdw_private, makeInteger(attnum));
+                    fdw_private = lappend(fdw_private, makeString(pstrdup(value)));
+                }
             }
         }
     }
@@ -489,40 +800,68 @@ levelPivotBeginForeignScan(ForeignScanState *node, int eflags)
 
         /* Get options */
         auto conn_options = get_server_options(server);
-        std::string key_pattern = get_table_option(table, "key_pattern");
+        TableMode mode = get_table_mode(table);
 
         /* Create dedicated memory context for scan state */
         MemoryContext scan_ctx = AllocSetContextCreate(estate->es_query_cxt,
                                                        "level_pivot scan",
                                                        ALLOCSET_DEFAULT_SIZES);
 
-        /* Create scan state using pg_construct for automatic cleanup */
-        auto state = level_pivot::pg_construct<LevelPivotScanState>(scan_ctx);
+        if (mode == TableMode::RAW) {
+            /* Raw mode: use RawScanner */
+            auto state = level_pivot::pg_construct<RawScanState>(scan_ctx);
 
-        /* Build projection from table definition */
-        state->projection = build_projection_from_relation(rel, key_pattern);
+            /* Get connection */
+            state->connection = level_pivot::ConnectionManager::instance()
+                .get_connection(server->serverid, conn_options);
 
-        /* Get connection */
-        state->connection = level_pivot::ConnectionManager::instance()
-            .get_connection(server->serverid, conn_options);
+            /* Create scanner */
+            state->scanner = std::make_unique<level_pivot::RawScanner>(
+                state->connection);
 
-        /* Create scanner */
-        state->scanner = std::make_unique<level_pivot::PivotScanner>(
-            *state->projection, state->connection);
+            /* Create temp memory context */
+            state->temp_context = AllocSetContextCreate(scan_ctx,
+                                                        "level_pivot temp",
+                                                        ALLOCSET_DEFAULT_SIZES);
 
-        /* Create temp memory context as child of scan context */
-        state->temp_context = AllocSetContextCreate(scan_ctx,
-                                                    "level_pivot temp",
-                                                    ALLOCSET_DEFAULT_SIZES);
+            /* Build bounds from fdw_private */
+            state->bounds = build_raw_bounds_from_fdw_private(fsplan->fdw_private);
 
-        /* Build prefix values from fdw_private for filter pushdown */
-        state->prefix_values = build_prefix_from_fdw_private(
-            fsplan->fdw_private, *state->projection);
+            /* Begin scan with bounds */
+            state->scanner->begin_scan(state->bounds);
 
-        /* Begin scan with prefix filter */
-        state->scanner->begin_scan(state->prefix_values);
+            node->fdw_state = state;
+        } else {
+            /* Pivot mode: use PivotScanner */
+            std::string key_pattern = get_table_option(table, "key_pattern");
 
-        node->fdw_state = state;
+            auto state = level_pivot::pg_construct<LevelPivotScanState>(scan_ctx);
+
+            /* Build projection from table definition */
+            state->projection = build_projection_from_relation(rel, key_pattern);
+
+            /* Get connection */
+            state->connection = level_pivot::ConnectionManager::instance()
+                .get_connection(server->serverid, conn_options);
+
+            /* Create scanner */
+            state->scanner = std::make_unique<level_pivot::PivotScanner>(
+                *state->projection, state->connection);
+
+            /* Create temp memory context as child of scan context */
+            state->temp_context = AllocSetContextCreate(scan_ctx,
+                                                        "level_pivot temp",
+                                                        ALLOCSET_DEFAULT_SIZES);
+
+            /* Build prefix values from fdw_private for filter pushdown */
+            state->prefix_values = build_prefix_from_fdw_private(
+                fsplan->fdw_private, *state->projection);
+
+            /* Begin scan with prefix filter */
+            state->scanner->begin_scan(state->prefix_values);
+
+            node->fdw_state = state;
+        }
     });
 }
 
@@ -534,36 +873,85 @@ TupleTableSlot *
 levelPivotIterateForeignScan(ForeignScanState *node)
 {
     TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
-    auto state = static_cast<LevelPivotScanState *>(node->fdw_state);
+    Relation rel = node->ss.ss_currentRelation;
+    ForeignTable *table = GetForeignTable(RelationGetRelid(rel));
+    TableMode mode = get_table_mode(table);
 
     ExecClearTuple(slot);
 
-    PG_TRY_CPP_RETURN({
-        auto row = state->scanner->next_row();
-        if (!row)
+    if (mode == TableMode::RAW) {
+        /* Raw mode iteration */
+        auto state = static_cast<RawScanState *>(node->fdw_state);
+
+        PG_TRY_CPP_RETURN({
+            auto row = state->scanner->next_row();
+            if (!row)
+                return slot;
+
+            /* Switch to temp context for value conversion */
+            MemoryContext oldctx = MemoryContextSwitchTo(state->temp_context);
+
+            /* Build tuple - raw tables have 2 columns: key, value */
+            TupleDesc tupdesc = slot->tts_tupleDescriptor;
+            Datum *values = slot->tts_values;
+            bool *nulls = slot->tts_isnull;
+
+            /* Initialize all to NULL */
+            memset(nulls, true, tupdesc->natts * sizeof(bool));
+
+            /* Find key and value columns and set their values */
+            for (int i = 0; i < tupdesc->natts; i++) {
+                Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+                if (attr->attisdropped)
+                    continue;
+
+                const char *colname = NameStr(attr->attname);
+                if (strcmp(colname, "key") == 0) {
+                    values[i] = CStringGetTextDatum(row->key.c_str());
+                    nulls[i] = false;
+                } else if (strcmp(colname, "value") == 0) {
+                    values[i] = CStringGetTextDatum(row->value.c_str());
+                    nulls[i] = false;
+                }
+            }
+
+            MemoryContextSwitchTo(oldctx);
+            MemoryContextReset(state->temp_context);
+
+            ExecStoreVirtualTuple(slot);
             return slot;
+        }, slot);
+    } else {
+        /* Pivot mode iteration */
+        auto state = static_cast<LevelPivotScanState *>(node->fdw_state);
 
-        /* Switch to temp context for value conversion */
-        MemoryContext oldctx = MemoryContextSwitchTo(state->temp_context);
+        PG_TRY_CPP_RETURN({
+            auto row = state->scanner->next_row();
+            if (!row)
+                return slot;
 
-        /* Build tuple */
-        TupleDesc tupdesc = slot->tts_tupleDescriptor;
-        Datum *values = slot->tts_values;
-        bool *nulls = slot->tts_isnull;
+            /* Switch to temp context for value conversion */
+            MemoryContext oldctx = MemoryContextSwitchTo(state->temp_context);
 
-        /* Initialize all to NULL */
-        memset(nulls, true, tupdesc->natts * sizeof(bool));
+            /* Build tuple */
+            TupleDesc tupdesc = slot->tts_tupleDescriptor;
+            Datum *values = slot->tts_values;
+            bool *nulls = slot->tts_isnull;
 
-        /* Fill in values using DatumBuilder */
-        level_pivot::DatumBuilder::build_datums(*row, *state->projection,
-                                                 values, nulls);
+            /* Initialize all to NULL */
+            memset(nulls, true, tupdesc->natts * sizeof(bool));
 
-        MemoryContextSwitchTo(oldctx);
-        MemoryContextReset(state->temp_context);
+            /* Fill in values using DatumBuilder */
+            level_pivot::DatumBuilder::build_datums(*row, *state->projection,
+                                                     values, nulls);
 
-        ExecStoreVirtualTuple(slot);
-        return slot;
-    }, slot);
+            MemoryContextSwitchTo(oldctx);
+            MemoryContextReset(state->temp_context);
+
+            ExecStoreVirtualTuple(slot);
+            return slot;
+        }, slot);
+    }
 }
 
 /*
@@ -573,12 +961,21 @@ levelPivotIterateForeignScan(ForeignScanState *node)
 void
 levelPivotReScanForeignScan(ForeignScanState *node)
 {
-    auto state = static_cast<LevelPivotScanState *>(node->fdw_state);
+    Relation rel = node->ss.ss_currentRelation;
+    ForeignTable *table = GetForeignTable(RelationGetRelid(rel));
+    TableMode mode = get_table_mode(table);
 
-    PG_TRY_CPP({
-        /* Rescan with the same prefix values for filter pushdown */
-        state->scanner->begin_scan(state->prefix_values);
-    });
+    if (mode == TableMode::RAW) {
+        auto state = static_cast<RawScanState *>(node->fdw_state);
+        PG_TRY_CPP({
+            state->scanner->rescan();
+        });
+    } else {
+        auto state = static_cast<LevelPivotScanState *>(node->fdw_state);
+        PG_TRY_CPP({
+            state->scanner->begin_scan(state->prefix_values);
+        });
+    }
 }
 
 /*
@@ -588,16 +985,21 @@ levelPivotReScanForeignScan(ForeignScanState *node)
 void
 levelPivotEndForeignScan(ForeignScanState *node)
 {
-    auto state = static_cast<LevelPivotScanState *>(node->fdw_state);
+    if (!node->fdw_state)
+        return;
 
-    if (state)
-    {
-        /* Call cleanup() to release resources early.
-         * The destructor will also be called via memory context callback
-         * when the scan context is deleted, but cleanup() is idempotent. */
+    Relation rel = node->ss.ss_currentRelation;
+    ForeignTable *table = GetForeignTable(RelationGetRelid(rel));
+    TableMode mode = get_table_mode(table);
+
+    if (mode == TableMode::RAW) {
+        auto state = static_cast<RawScanState *>(node->fdw_state);
         state->cleanup();
-        node->fdw_state = nullptr;
+    } else {
+        auto state = static_cast<LevelPivotScanState *>(node->fdw_state);
+        state->cleanup();
     }
+    node->fdw_state = nullptr;
 }
 
 /*
@@ -607,64 +1009,129 @@ levelPivotEndForeignScan(ForeignScanState *node)
 void
 levelPivotExplainForeignScan(ForeignScanState *node, ExplainState *es)
 {
-    auto state = static_cast<LevelPivotScanState *>(node->fdw_state);
-
-    /* Show pushed filters even without ANALYZE */
+    Relation rel = node->ss.ss_currentRelation;
+    ForeignTable *table = GetForeignTable(RelationGetRelid(rel));
+    TableMode mode = get_table_mode(table);
     ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
-    if (fsplan->fdw_private != NIL) {
-        /*
-         * Build a description of pushed filters from fdw_private.
-         * Need to map attnums back to column names.
-         */
-        Relation rel = node->ss.ss_currentRelation;
-        TupleDesc tupdesc = RelationGetDescr(rel);
 
-        std::string filters;
-        List *fdw_private = fsplan->fdw_private;
-        ListCell *cell = list_head(fdw_private);
+    if (mode == TableMode::RAW) {
+        /* Raw mode: show key bounds */
+        auto state = static_cast<RawScanState *>(node->fdw_state);
 
-        while (cell != NULL) {
-            AttrNumber attnum = intVal(lfirst(cell));
-            cell = lnext(fdw_private, cell);
-            if (cell == NULL)
-                break;
-            char *value = strVal(lfirst(cell));
-            cell = lnext(fdw_private, cell);
+        if (fsplan->fdw_private != NIL) {
+            List *fdw_private = fsplan->fdw_private;
+            ListCell *cell = list_head(fdw_private);
 
-            /* Find column name for this attnum */
-            const char *colname = NULL;
-            for (int i = 0; i < tupdesc->natts; i++) {
-                Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
-                if (attr->attnum == attnum) {
-                    colname = NameStr(attr->attname);
+            /* Check for raw mode marker */
+            if (cell != NULL && intVal(lfirst(cell)) == -1) {
+                cell = lnext(fdw_private, cell);
+
+                std::string bounds_desc;
+                while (cell != NULL) {
+                    int strategy = intVal(lfirst(cell));
+                    cell = lnext(fdw_private, cell);
+                    if (cell == NULL)
+                        break;
+                    char *value = strVal(lfirst(cell));
+                    cell = lnext(fdw_private, cell);
+
+                    if (!bounds_desc.empty())
+                        bounds_desc += ", ";
+
+                    switch (strategy) {
+                        case BTEqualStrategyNumber:
+                            bounds_desc += "key='";
+                            bounds_desc += value;
+                            bounds_desc += "'";
+                            break;
+                        case BTLessStrategyNumber:
+                            bounds_desc += "key<'";
+                            bounds_desc += value;
+                            bounds_desc += "'";
+                            break;
+                        case BTLessEqualStrategyNumber:
+                            bounds_desc += "key<='";
+                            bounds_desc += value;
+                            bounds_desc += "'";
+                            break;
+                        case BTGreaterStrategyNumber:
+                            bounds_desc += "key>'";
+                            bounds_desc += value;
+                            bounds_desc += "'";
+                            break;
+                        case BTGreaterEqualStrategyNumber:
+                            bounds_desc += "key>='";
+                            bounds_desc += value;
+                            bounds_desc += "'";
+                            break;
+                    }
+                }
+
+                if (!bounds_desc.empty()) {
+                    ExplainPropertyText("LevelDB Key Bounds", bounds_desc.c_str(), es);
+                }
+            }
+        }
+
+        if (state && state->scanner) {
+            const auto& stats = state->scanner->stats();
+            ExplainPropertyInteger("LevelDB Keys Scanned", NULL,
+                                  stats.keys_scanned, es);
+        }
+    } else {
+        /* Pivot mode */
+        auto state = static_cast<LevelPivotScanState *>(node->fdw_state);
+
+        if (fsplan->fdw_private != NIL) {
+            TupleDesc tupdesc = RelationGetDescr(rel);
+
+            std::string filters;
+            List *fdw_private = fsplan->fdw_private;
+            ListCell *cell = list_head(fdw_private);
+
+            while (cell != NULL) {
+                AttrNumber attnum = intVal(lfirst(cell));
+                cell = lnext(fdw_private, cell);
+                if (cell == NULL)
                     break;
+                char *value = strVal(lfirst(cell));
+                cell = lnext(fdw_private, cell);
+
+                /* Find column name for this attnum */
+                const char *colname = NULL;
+                for (int i = 0; i < tupdesc->natts; i++) {
+                    Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+                    if (attr->attnum == attnum) {
+                        colname = NameStr(attr->attname);
+                        break;
+                    }
+                }
+
+                if (colname) {
+                    if (!filters.empty())
+                        filters += ", ";
+                    filters += colname;
+                    filters += "='";
+                    filters += value;
+                    filters += "'";
                 }
             }
 
-            if (colname) {
-                if (!filters.empty())
-                    filters += ", ";
-                filters += colname;
-                filters += "='";
-                filters += value;
-                filters += "'";
+            if (!filters.empty()) {
+                ExplainPropertyText("LevelDB Prefix Filter", filters.c_str(), es);
             }
         }
 
-        if (!filters.empty()) {
-            ExplainPropertyText("LevelDB Prefix Filter", filters.c_str(), es);
+        if (state && state->scanner)
+        {
+            const auto& stats = state->scanner->stats();
+            ExplainPropertyInteger("LevelDB Keys Scanned", NULL,
+                                  stats.keys_scanned, es);
+            ExplainPropertyInteger("LevelDB Keys Skipped", NULL,
+                                  stats.keys_skipped, es);
+            ExplainPropertyInteger("Rows Returned", NULL,
+                                  stats.rows_returned, es);
         }
-    }
-
-    if (state && state->scanner)
-    {
-        const auto& stats = state->scanner->stats();
-        ExplainPropertyInteger("LevelDB Keys Scanned", NULL,
-                              stats.keys_scanned, es);
-        ExplainPropertyInteger("LevelDB Keys Skipped", NULL,
-                              stats.keys_skipped, es);
-        ExplainPropertyInteger("Rows Returned", NULL,
-                              stats.rows_returned, es);
     }
 }
 
@@ -678,7 +1145,7 @@ levelPivotAddForeignUpdateTargets(PlannerInfo *root,
                                   RangeTblEntry *target_rte,
                                   Relation target_relation)
 {
-    /* We use the whole row as the row identifier */
+    /* Use whole row as the row identifier for both modes */
     Var *var = makeWholeRowVar(target_rte, rtindex, 0, false);
     add_row_identity_var(root, var, rtindex, "wholerow");
 }
@@ -716,47 +1183,70 @@ levelPivotBeginForeignModify(ModifyTableState *mtstate,
         Relation rel = rinfo->ri_RelationDesc;
         ForeignTable *table = GetForeignTable(RelationGetRelid(rel));
         ForeignServer *server = GetForeignServer(table->serverid);
+        TableMode mode = get_table_mode(table);
 
         /* Get options */
         auto conn_options = get_server_options(server);
         conn_options.read_only = false;  /* Need write access */
-
-        std::string key_pattern = get_table_option(table, "key_pattern");
 
         /* Create dedicated memory context for modify state */
         MemoryContext modify_ctx = AllocSetContextCreate(estate->es_query_cxt,
                                                          "level_pivot modify",
                                                          ALLOCSET_DEFAULT_SIZES);
 
-        /* Create modify state using pg_construct for automatic cleanup */
-        auto state = level_pivot::pg_construct<LevelPivotModifyState>(modify_ctx);
+        if (mode == TableMode::RAW) {
+            /* Raw mode: use RawWriter */
+            auto state = level_pivot::pg_construct<RawModifyState>(modify_ctx);
 
-        /* Build projection */
-        state->projection = build_projection_from_relation(rel, key_pattern);
+            /* Get connection */
+            state->connection = level_pivot::ConnectionManager::instance()
+                .get_connection(server->serverid, conn_options);
 
-        /* Get connection */
-        state->connection = level_pivot::ConnectionManager::instance()
-            .get_connection(server->serverid, conn_options);
+            /* Store write batch setting */
+            state->use_write_batch = conn_options.use_write_batch;
 
-        /* Store write batch setting */
-        state->use_write_batch = conn_options.use_write_batch;
+            /* Create writer */
+            state->writer = std::make_unique<level_pivot::RawWriter>(
+                state->connection, conn_options.use_write_batch);
 
-        /* Create writer - with or without batch depending on options */
-        if (conn_options.use_write_batch) {
-            auto batch = std::make_unique<level_pivot::LevelDBWriteBatch>(
-                state->connection->create_batch());
-            state->writer = std::make_unique<level_pivot::Writer>(
-                *state->projection, state->connection, std::move(batch));
+            /* Find key and value columns */
+            state->key_attnum = find_column_attnum(rel, "key");
+            state->value_attnum = find_column_attnum(rel, "value");
+
+            rinfo->ri_FdwState = state;
         } else {
-            state->writer = std::make_unique<level_pivot::Writer>(
-                *state->projection, state->connection);
+            /* Pivot mode: use Writer */
+            std::string key_pattern = get_table_option(table, "key_pattern");
+
+            auto state = level_pivot::pg_construct<LevelPivotModifyState>(modify_ctx);
+
+            /* Build projection */
+            state->projection = build_projection_from_relation(rel, key_pattern);
+
+            /* Get connection */
+            state->connection = level_pivot::ConnectionManager::instance()
+                .get_connection(server->serverid, conn_options);
+
+            /* Store write batch setting */
+            state->use_write_batch = conn_options.use_write_batch;
+
+            /* Create writer - with or without batch depending on options */
+            if (conn_options.use_write_batch) {
+                auto batch = std::make_unique<level_pivot::LevelDBWriteBatch>(
+                    state->connection->create_batch());
+                state->writer = std::make_unique<level_pivot::Writer>(
+                    *state->projection, state->connection, std::move(batch));
+            } else {
+                state->writer = std::make_unique<level_pivot::Writer>(
+                    *state->projection, state->connection);
+            }
+
+            /* Store column count */
+            TupleDesc tupdesc = RelationGetDescr(rel);
+            state->num_cols = tupdesc->natts;
+
+            rinfo->ri_FdwState = state;
         }
-
-        /* Store column count */
-        TupleDesc tupdesc = RelationGetDescr(rel);
-        state->num_cols = tupdesc->natts;
-
-        rinfo->ri_FdwState = state;
     });
 }
 
@@ -770,13 +1260,40 @@ levelPivotExecForeignInsert(EState *estate,
                             TupleTableSlot *slot,
                             TupleTableSlot *planSlot)
 {
-    auto state = static_cast<LevelPivotModifyState *>(rinfo->ri_FdwState);
+    Relation rel = rinfo->ri_RelationDesc;
+    ForeignTable *table = GetForeignTable(RelationGetRelid(rel));
+    TableMode mode = get_table_mode(table);
 
-    PG_TRY_CPP_RETURN({
-        slot_getallattrs(slot);
-        state->writer->insert(slot->tts_values, slot->tts_isnull);
-        return slot;
-    }, slot);
+    if (mode == TableMode::RAW) {
+        auto state = static_cast<RawModifyState *>(rinfo->ri_FdwState);
+
+        PG_TRY_CPP_RETURN({
+            slot_getallattrs(slot);
+
+            /* Extract key and value from slot */
+            int key_idx = state->key_attnum - 1;
+            int val_idx = state->value_attnum - 1;
+
+            if (slot->tts_isnull[key_idx])
+                elog(ERROR, "key column cannot be NULL");
+
+            std::string key = TextDatumGetCString(slot->tts_values[key_idx]);
+            std::string value;
+            if (!slot->tts_isnull[val_idx])
+                value = TextDatumGetCString(slot->tts_values[val_idx]);
+
+            state->writer->insert(key, value);
+            return slot;
+        }, slot);
+    } else {
+        auto state = static_cast<LevelPivotModifyState *>(rinfo->ri_FdwState);
+
+        PG_TRY_CPP_RETURN({
+            slot_getallattrs(slot);
+            state->writer->insert(slot->tts_values, slot->tts_isnull);
+            return slot;
+        }, slot);
+    }
 }
 
 /*
@@ -789,37 +1306,79 @@ levelPivotExecForeignUpdate(EState *estate,
                             TupleTableSlot *slot,
                             TupleTableSlot *planSlot)
 {
-    auto state = static_cast<LevelPivotModifyState *>(rinfo->ri_FdwState);
+    Relation rel = rinfo->ri_RelationDesc;
+    ForeignTable *table = GetForeignTable(RelationGetRelid(rel));
+    TableMode mode = get_table_mode(table);
 
-    PG_TRY_CPP_RETURN({
-        /* Get the old row from the wholerow junk attribute */
-        bool isnull;
-        Datum datum = ExecGetJunkAttribute(planSlot,
-                          rinfo->ri_RowIdAttNo,
-                          &isnull);
+    if (mode == TableMode::RAW) {
+        auto state = static_cast<RawModifyState *>(rinfo->ri_FdwState);
 
-        if (isnull)
-            elog(ERROR, "wholerow is NULL");
+        PG_TRY_CPP_RETURN({
+            /* Get the old row from the wholerow junk attribute */
+            bool isnull;
+            Datum datum = ExecGetJunkAttribute(planSlot,
+                              rinfo->ri_RowIdAttNo,
+                              &isnull);
 
-        HeapTupleHeader oldtup = DatumGetHeapTupleHeader(datum);
+            if (isnull)
+                elog(ERROR, "wholerow is NULL");
 
-        /* Extract old values using stack-based TempArray */
-        DatumTempArray old_values(state->num_cols);
-        BoolTempArray old_nulls(state->num_cols);
+            HeapTupleHeader oldtup = DatumGetHeapTupleHeader(datum);
 
-        for (int i = 0; i < state->num_cols; i++)
-        {
-            old_values[i] = GetAttributeByNum(oldtup, i + 1, &old_nulls[i]);
-        }
+            /* Extract key from old row */
+            int key_idx = state->key_attnum;
+            bool key_null;
+            Datum key_datum = GetAttributeByNum(oldtup, key_idx, &key_null);
 
-        /* Get new values from slot */
-        slot_getallattrs(slot);
+            if (key_null)
+                elog(ERROR, "key column cannot be NULL");
 
-        state->writer->update(old_values.data(), old_nulls.data(),
-                             slot->tts_values, slot->tts_isnull);
+            std::string key = TextDatumGetCString(key_datum);
 
-        return slot;
-    }, slot);
+            /* Get new value from slot */
+            slot_getallattrs(slot);
+            int val_idx = state->value_attnum - 1;
+
+            std::string new_value;
+            if (!slot->tts_isnull[val_idx])
+                new_value = TextDatumGetCString(slot->tts_values[val_idx]);
+
+            state->writer->update(key, new_value);
+            return slot;
+        }, slot);
+    } else {
+        auto state = static_cast<LevelPivotModifyState *>(rinfo->ri_FdwState);
+
+        PG_TRY_CPP_RETURN({
+            /* Get the old row from the wholerow junk attribute */
+            bool isnull;
+            Datum datum = ExecGetJunkAttribute(planSlot,
+                              rinfo->ri_RowIdAttNo,
+                              &isnull);
+
+            if (isnull)
+                elog(ERROR, "wholerow is NULL");
+
+            HeapTupleHeader oldtup = DatumGetHeapTupleHeader(datum);
+
+            /* Extract old values using stack-based TempArray */
+            DatumTempArray old_values(state->num_cols);
+            BoolTempArray old_nulls(state->num_cols);
+
+            for (int i = 0; i < state->num_cols; i++)
+            {
+                old_values[i] = GetAttributeByNum(oldtup, i + 1, &old_nulls[i]);
+            }
+
+            /* Get new values from slot */
+            slot_getallattrs(slot);
+
+            state->writer->update(old_values.data(), old_nulls.data(),
+                                 slot->tts_values, slot->tts_isnull);
+
+            return slot;
+        }, slot);
+    }
 }
 
 /*
@@ -832,33 +1391,67 @@ levelPivotExecForeignDelete(EState *estate,
                             TupleTableSlot *slot,
                             TupleTableSlot *planSlot)
 {
-    auto state = static_cast<LevelPivotModifyState *>(rinfo->ri_FdwState);
+    Relation rel = rinfo->ri_RelationDesc;
+    ForeignTable *table = GetForeignTable(RelationGetRelid(rel));
+    TableMode mode = get_table_mode(table);
 
-    PG_TRY_CPP_RETURN({
-        /* Get the row from the wholerow junk attribute */
-        bool isnull;
-        Datum datum = ExecGetJunkAttribute(planSlot,
-                          rinfo->ri_RowIdAttNo,
-                          &isnull);
+    if (mode == TableMode::RAW) {
+        auto state = static_cast<RawModifyState *>(rinfo->ri_FdwState);
 
-        if (isnull)
-            elog(ERROR, "wholerow is NULL");
+        PG_TRY_CPP_RETURN({
+            /* Get the old row from the wholerow junk attribute */
+            bool isnull;
+            Datum datum = ExecGetJunkAttribute(planSlot,
+                              rinfo->ri_RowIdAttNo,
+                              &isnull);
 
-        HeapTupleHeader oldtup = DatumGetHeapTupleHeader(datum);
+            if (isnull)
+                elog(ERROR, "wholerow is NULL");
 
-        /* Extract values using stack-based TempArray */
-        DatumTempArray values(state->num_cols);
-        BoolTempArray nulls(state->num_cols);
+            HeapTupleHeader oldtup = DatumGetHeapTupleHeader(datum);
 
-        for (int i = 0; i < state->num_cols; i++)
-        {
-            values[i] = GetAttributeByNum(oldtup, i + 1, &nulls[i]);
-        }
+            /* Extract key from old row */
+            int key_idx = state->key_attnum;
+            bool key_null;
+            Datum key_datum = GetAttributeByNum(oldtup, key_idx, &key_null);
 
-        state->writer->remove(values.data(), nulls.data());
+            if (key_null)
+                elog(ERROR, "key column cannot be NULL");
 
-        return slot;
-    }, slot);
+            std::string key = TextDatumGetCString(key_datum);
+            state->writer->remove(key);
+
+            return slot;
+        }, slot);
+    } else {
+        auto state = static_cast<LevelPivotModifyState *>(rinfo->ri_FdwState);
+
+        PG_TRY_CPP_RETURN({
+            /* Get the row from the wholerow junk attribute */
+            bool isnull;
+            Datum datum = ExecGetJunkAttribute(planSlot,
+                              rinfo->ri_RowIdAttNo,
+                              &isnull);
+
+            if (isnull)
+                elog(ERROR, "wholerow is NULL");
+
+            HeapTupleHeader oldtup = DatumGetHeapTupleHeader(datum);
+
+            /* Extract values using stack-based TempArray */
+            DatumTempArray values(state->num_cols);
+            BoolTempArray nulls(state->num_cols);
+
+            for (int i = 0; i < state->num_cols; i++)
+            {
+                values[i] = GetAttributeByNum(oldtup, i + 1, &nulls[i]);
+            }
+
+            state->writer->remove(values.data(), nulls.data());
+
+            return slot;
+        }, slot);
+    }
 }
 
 /*
@@ -868,10 +1461,16 @@ levelPivotExecForeignDelete(EState *estate,
 void
 levelPivotEndForeignModify(EState *estate, ResultRelInfo *rinfo)
 {
-    auto state = static_cast<LevelPivotModifyState *>(rinfo->ri_FdwState);
+    if (!rinfo->ri_FdwState)
+        return;
 
-    if (state)
-    {
+    Relation rel = rinfo->ri_RelationDesc;
+    ForeignTable *table = GetForeignTable(RelationGetRelid(rel));
+    TableMode mode = get_table_mode(table);
+
+    if (mode == TableMode::RAW) {
+        auto state = static_cast<RawModifyState *>(rinfo->ri_FdwState);
+
         PG_TRY_CPP({
             /* Commit batch if using batched writes */
             if (state->writer && state->use_write_batch) {
@@ -879,12 +1478,20 @@ levelPivotEndForeignModify(EState *estate, ResultRelInfo *rinfo)
             }
         });
 
-        /* Call cleanup() to release resources early.
-         * The destructor will also be called via memory context callback
-         * when the modify context is deleted, but cleanup() is idempotent. */
         state->cleanup();
-        rinfo->ri_FdwState = nullptr;
+    } else {
+        auto state = static_cast<LevelPivotModifyState *>(rinfo->ri_FdwState);
+
+        PG_TRY_CPP({
+            /* Commit batch if using batched writes */
+            if (state->writer && state->use_write_batch) {
+                state->writer->commit_batch();
+            }
+        });
+
+        state->cleanup();
     }
+    rinfo->ri_FdwState = nullptr;
 }
 
 /*

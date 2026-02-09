@@ -32,7 +32,8 @@ const std::unordered_set<std::string> server_options = {
 /* Valid FOREIGN TABLE options */
 const std::unordered_set<std::string> table_options = {
     "key_pattern",
-    "prefix_filter"
+    "prefix_filter",
+    "table_mode"
 };
 
 bool is_valid_bool(const char* value) {
@@ -120,7 +121,7 @@ void levelPivotValidateOptions(List *options_list, Oid catalog)
                 ereport(ERROR,
                     (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
                      errmsg("invalid option \"%s\" for FOREIGN TABLE", def->defname),
-                     errhint("Valid options are: key_pattern, prefix_filter")));
+                     errhint("Valid options are: key_pattern, prefix_filter, table_mode")));
             }
 
             const char* value = defGetString(def);
@@ -142,6 +143,18 @@ void levelPivotValidateOptions(List *options_list, Oid catalog)
                     ereport(ERROR,
                         (errcode(ERRCODE_FDW_INVALID_ATTRIBUTE_VALUE),
                          errmsg("invalid key_pattern: %s", e.what())));
+                }
+            }
+            else if (name == "table_mode")
+            {
+                /* Validate table_mode is 'raw' or 'pivot' */
+                std::string mode(value);
+                if (mode != "raw" && mode != "pivot")
+                {
+                    ereport(ERROR,
+                        (errcode(ERRCODE_FDW_INVALID_ATTRIBUTE_VALUE),
+                         errmsg("invalid value for table_mode: \"%s\"", value),
+                         errhint("Valid values are 'raw' or 'pivot'")));
                 }
             }
         }
@@ -171,21 +184,42 @@ void levelPivotValidateOptions(List *options_list, Oid catalog)
     else if (catalog == ForeignTableRelationId)
     {
         bool has_key_pattern = false;
+        bool is_raw_mode = false;
         foreach(cell, options_list)
         {
             DefElem *def = (DefElem *) lfirst(cell);
             if (strcmp(def->defname, "key_pattern") == 0)
             {
                 has_key_pattern = true;
-                break;
+            }
+            else if (strcmp(def->defname, "table_mode") == 0)
+            {
+                std::string mode(defGetString(def));
+                is_raw_mode = (mode == "raw");
             }
         }
 
-        if (!has_key_pattern)
+        /* Validate key_pattern based on table_mode */
+        if (is_raw_mode)
         {
-            ereport(ERROR,
-                (errcode(ERRCODE_FDW_OPTION_NAME_NOT_FOUND),
-                 errmsg("required option \"key_pattern\" not specified")));
+            if (has_key_pattern)
+            {
+                ereport(ERROR,
+                    (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                     errmsg("key_pattern is not allowed for raw table mode"),
+                     errhint("Raw tables use key/value columns directly without pivoting")));
+            }
+        }
+        else
+        {
+            /* Default pivot mode - key_pattern is required */
+            if (!has_key_pattern)
+            {
+                ereport(ERROR,
+                    (errcode(ERRCODE_FDW_OPTION_NAME_NOT_FOUND),
+                     errmsg("required option \"key_pattern\" not specified"),
+                     errhint("Use key_pattern for pivot mode, or set table_mode='raw' for raw access")));
+            }
         }
     }
 }

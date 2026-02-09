@@ -77,6 +77,14 @@ if [[ $FAILED -eq 0 ]]; then
         run_test "${SCRIPT_DIR}/test_write_batch.sql" || FAILED=1
     fi
 
+    # Run raw table mode tests
+    if [[ -f "${SCRIPT_DIR}/test_raw_validation.sql" ]]; then
+        run_test "${SCRIPT_DIR}/test_raw_validation.sql" || FAILED=1
+    fi
+    if [[ -f "${SCRIPT_DIR}/test_raw.sql" ]]; then
+        run_test "${SCRIPT_DIR}/test_raw.sql" || FAILED=1
+    fi
+
     # Run cleanup
     run_test "${SCRIPT_DIR}/cleanup.sql" || FAILED=1
 fi

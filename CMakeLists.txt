@@ -32,8 +32,10 @@ add_library(level_pivot_core STATIC
     src/projection.cpp
     src/type_converter.cpp
     src/pivot_scanner.cpp
+    src/raw_scanner.cpp
     src/connection_manager.cpp
     src/writer.cpp
+    src/raw_writer.cpp
     src/schema_discovery.cpp
 )
 
