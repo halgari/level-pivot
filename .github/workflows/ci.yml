@@ -177,6 +177,10 @@ jobs:
             "version": "${VERSION}",
             "description": "linux-x64 binaries for @halgari/level-pivot",
             "main": "index.js",
+            "scripts": {
+              "build": "echo 'No build needed for binary package'",
+              "test": "echo 'No tests for binary package'"
+            },
             "files": [
               "index.js",
               "binaries",
